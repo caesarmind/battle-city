@@ -106,13 +106,17 @@
   // Bullets use the same gate mechanism (sub_E604_bullets_movement) and are
   // ROM-exact at 30/60, but that makes the base tier's bullet the same speed
   // as an idle enemy tank - slower than the player firing it. Deliberate
-  // deviation (like the massive tank's twin gun): doubled to 60/120 so it
-  // still reads as a shot, not a NES-purity target. Halve both to go exact.
-  BC.BULLET_SPEED = 60;       // slow bullet
-  BC.BULLET_SPEED_FAST = 120; // fast bullet
+  // deviation (like the massive tank's twin gun): scaled up from the ROM
+  // value so it still reads as a shot, not a NES-purity target.
+  // Calibrated against a user-measured field crossing: the real ROM's default
+  // (tier-1) bullet takes 1.83s bottom-to-top; the prior 60/120 pair measured
+  // 1.65s for the same trip - 9.8% too fast - so both are scaled by 1.65/1.83
+  // (108.2/120 = 0.9016) to land on the real timing. Halve both to go ROM-exact.
+  BC.BULLET_SPEED = 54.1;      // slow bullet
+  BC.BULLET_SPEED_FAST = 108.2; // fast bullet
   // Star tiers per the original: 0 slow shot, 1+ fast shot, 2+ two bullets,
   // 3 breaks steel. Tank 1990: the player spawns with one star.
-  BC.PLAYER_BULLET_SPEED = [60, 120, 120, 120];
+  BC.PLAYER_BULLET_SPEED = [54.1, 108.2, 108.2, 108.2];
   BC.PLAYER_START_TIER = 1;
 
   // Spawn positions in subtile coords (top-left corner of the 2x2 tank cell)
@@ -128,7 +132,7 @@
 
   // Build version, exchanged in the online handshake: both players must run
   // the same build so locally-constructed stages match the host's simulation.
-  BC.VERSION = '5.10';
+  BC.VERSION = '5.11';
 
   // Live per-run state (reset by GameScene on new game)
   BC.session = null;
@@ -2978,9 +2982,16 @@
       if (off < 0 || off + count * STAGE_BYTES > L.prgEnd) break;
       const score = scoreTable(rom, off, Math.min(count, STAGE_COUNT), L.prgEnd);
       if (score < 0) continue;
+      // A cart may describe one table as several narrow sets (these carts
+      // declare 3x12 as well as 1x36). If the full run also validates at the
+      // same address it is that same table seen whole, not a shorter one -
+      // without this a cart lacking the wide entry imports only 12 stages and
+      // silently leaves the rest as built-in levels.
+      let n = count;
+      if (n < STAGE_COUNT && scoreTable(rom, off, STAGE_COUNT, L.prgEnd) >= 0) n = STAGE_COUNT;
       // prefer the widest set - that is the "all stages" entry
-      if (!best || count > best.count || (count === best.count && off < best.offset)) {
-        best = { offset: off, count, score, via: 'dispatch' };
+      if (!best || n > best.count || (n === best.count && off < best.offset)) {
+        best = { offset: off, count: n, score, via: 'dispatch' };
       }
     }
     return best;
@@ -3004,12 +3015,20 @@
     let best = null;
     const last = L.prgEnd - STAGE_COUNT * STAGE_BYTES;
     for (let o = L.prgStart; o <= last; o++) {
+      if (!ok[o - L.prgStart]) continue;
+      // Only consider the START of a run. Every entry-aligned window inside a
+      // long table validates as well as the table itself, so without this the
+      // winner is decided by scan order rather than by evidence - and on a
+      // uniform file every single offset gets fully scored, which is what made
+      // a large all-zero file take tens of seconds.
+      const prev = o - STAGE_BYTES;
+      if (prev >= L.prgStart && ok[prev - L.prgStart]) continue;
       let run = 0;
-      while (run < STAGE_COUNT && ok[o - L.prgStart + run * STAGE_BYTES]) run++;
+      while (ok[o - L.prgStart + run * STAGE_BYTES]) run++;
       if (run < STAGE_COUNT) continue;
       const score = scoreTable(rom, o, STAGE_COUNT, L.prgEnd);
       if (score < 0) continue;
-      if (!best || score > best.score) best = { offset: o, count: STAGE_COUNT, score, via: 'scan' };
+      if (!best || score > best.score) best = { offset: o, count: run, score, via: 'scan' };
     }
     return best;
   }
@@ -3052,6 +3071,12 @@
       const data = new Uint8Array(buffer);
       if (data.length < STAGE_BYTES || data.length % STAGE_BYTES !== 0) return null;
       const count = data.length / STAGE_BYTES;
+      // Every entry has to be something the renderer could actually draw.
+      // Without this any file whose size happens to divide by 91 imports as
+      // noise and reports success.
+      for (let i = 0; i < count; i++) {
+        if (!drawable(data, i * STAGE_BYTES, data.length)) return null;
+      }
       const stages = {};
       for (let i = 0; i < count; i++) {
         const n = (startStage || 1) + i;
@@ -3103,13 +3128,18 @@
     // Raw files are assigned by the first number in their name when present
     // (stage_07.bin -> stage 7), otherwise by selection order.
     installFiles(files) {
-      // a .nes file, or failing that any file too large to be a stage blob
+      // An exact multiple of 91 is a stage blob, however big it is - a large
+      // one used to be mistaken for a ROM and re-located by the scan, which
+      // imported a shifted set of maps and still reported success.
+      const isBlob = (f) => f.buffer.byteLength >= STAGE_BYTES
+        && f.buffer.byteLength % STAGE_BYTES === 0;
       const rom = files.find((f) => /\.nes$/i.test(f.name || ''))
-        || files.find((f) => f.buffer.byteLength > 4096);
+        || files.find((f) => f.buffer.byteLength > 4096 && !isBlob(f));
+      let romErr = null;
       if (rom) {
         const res = this.install(rom.buffer);
-        // a ROM we could not read might still be a bare run of stage entries
-        if (res.ok || rom.buffer.byteLength % STAGE_BYTES !== 0) return res;
+        if (res.ok) return res;
+        romErr = res;   // fall through - the other files may still be blobs
       }
 
       const withNums = files
@@ -3127,7 +3157,7 @@
           count += 1;
         }
       }
-      if (!count) return { ok: false, error: 'UNRECOGNISED FILE FORMAT' };
+      if (!count) return romErr || { ok: false, error: 'UNRECOGNISED FILE FORMAT' };
       return { ok: true, count };
     },
   };
@@ -3619,6 +3649,11 @@
       this.animFrame = 0;
       this.animDist = 0;
       this.skid = 0;
+      // Player-only 180-turn lock (see drive()): -1 = not locked, otherwise
+      // the direction a reversal turned to face but hasn't been cleared to
+      // drive in yet.
+      this._reversalLockDir = -1;
+      this._lastWantDir = -1;
       this.sprite = scene.add.sprite(0, 0, 'atlas', opts.frameBase + '_0_0')
         .setDepth(BC.DEPTH.TANK);
       this.syncSprite();
@@ -3706,6 +3741,14 @@
     // Ice (players only, NES behavior): stepping onto ice while moving arms a
     // 28px skid; its first 13px are FORCED (input ignored), after which a held
     // direction regains control; releasing input slides out the remainder.
+    //
+    // Player-only 180 reversal lock: pressing the opposite of the current
+    // facing only turns the tank in place - it does not also start driving
+    // that same frame the way a perpendicular turn does. Holding the key
+    // through keeps it locked in place; releasing and pressing again (a
+    // fresh edge on the same direction) clears the lock and drives normally.
+    // Enemies are unaffected (isPlayer guards every branch below) - their AI
+    // still turns and moves in the same tick on a reversal, as before.
     drive(wantDir, dt, tanks) {
       let moved = 0;
       const onIce = this.isPlayer && this.terrain.isIceAtPx(this.x, this.y);
@@ -3717,6 +3760,7 @@
         this.skid = moved > 0 ? Math.max(15, this.skid - moved) : 15;
         this._animate(moved);
         this.syncSprite();
+        if (this.isPlayer) this._lastWantDir = wantDir;
         return moved;
       }
 
@@ -3738,12 +3782,34 @@
             if (snapBlocked) {
               // refuse the turn this frame rather than embed in a neighbor
               this.syncSprite();
+              if (this.isPlayer) this._lastWantDir = wantDir;
               return 0;
             }
             this.x = nx;
             this.y = ny;
+            this.dir = wantDir;
+            if (this.isPlayer) this._reversalLockDir = -1;
+          } else if (this.isPlayer) {
+            // 180 reversal: turn now, lock movement until a fresh press
+            this.dir = wantDir;
+            this._reversalLockDir = wantDir;
+            this._lastWantDir = wantDir;
+            this._animate(0);
+            this.syncSprite();
+            return 0;
+          } else {
+            this.dir = wantDir; // enemies: unchanged, turn and move same tick
           }
-          this.dir = wantDir;
+        }
+        if (this.isPlayer && this._reversalLockDir === wantDir) {
+          if (wantDir === this._lastWantDir) {
+            // still holding through the reversal turn: stay put
+            this._animate(0);
+            this.syncSprite();
+            this._lastWantDir = wantDir;
+            return 0;
+          }
+          this._reversalLockDir = -1; // released and pressed again: cleared
         }
         moved = this._axisMove(this.dir, this.speed * dt, tanks);
         // moving onto ice with an empty counter arms a fresh 28px skid
@@ -3755,6 +3821,7 @@
       }
       this._animate(moved);
       this.syncSprite();
+      if (this.isPlayer) this._lastWantDir = wantDir;
       return moved;
     }
 

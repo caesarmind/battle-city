@@ -121,7 +121,7 @@
 
   // Build version, exchanged in the online handshake: both players must run
   // the same build so locally-constructed stages match the host's simulation.
-  BC.VERSION = '5.1';
+  BC.VERSION = '5.2';
 
   // Live per-run state (reset by GameScene on new game)
   BC.session = null;
@@ -136,12 +136,13 @@
   BC.newSession = function (stage, playerCount) {
     const n = playerCount === 2 ? 2 : 1;
     const players = [];
-    for (let i = 0; i < n; i++) players.push({ lives: 3, tier: BC.PLAYER_START_TIER });
+    for (let i = 0; i < n; i++) {
+      players.push({ lives: 3, tier: BC.PLAYER_START_TIER, extraLifeGiven: false });
+    }
     BC.session = {
       stage: stage,
       score: 0,
       players: players,
-      nextLifeAt: BC.EXTRA_LIFE_SCORE,
       kills: [0, 0, 0, 0],
     };
     return BC.session;
@@ -151,15 +152,16 @@
     const s = BC.session;
     if (!s) return;
     s.score += pts;
-    if (s.score >= s.nextLifeAt) {
-      s.nextLifeAt += BC.EXTRA_LIFE_SCORE;
-      // shared score pool: the extra life goes to whichever still-playing
-      // player has fewest lives (an eliminated player can't cash it in)
-      const inPlay = s.players.filter((p) => p.lives > 0);
-      let worst = inPlay[0] || s.players[0];
-      for (const p of inPlay) if (p.lives < worst.lives) worst = p;
-      worst.lives += 1;
-      if (BC.sfx) BC.sfx.play('life');
+    // ROM: exactly ONE extra life per player, the first time 20,000 is reached
+    // (40k/60k give nothing). Shared pool here, so it goes to a still-playing
+    // player who has not had theirs yet.
+    if (s.score >= BC.EXTRA_LIFE_SCORE) {
+      const p = s.players.find((q) => q.lives > 0 && !q.extraLifeGiven);
+      if (p) {
+        p.extraLifeGiven = true;
+        p.lives += 1;
+        if (BC.sfx) BC.sfx.play('life');
+      }
     }
   };
 })();
@@ -249,6 +251,11 @@
     },
     getSound: function () { return !!get('bc.sound', true); },
     setSound: function (on) { set('bc.sound', !!on); },
+    getCustomStages: function () {
+      const v = get('bc.stages', null);
+      return v && typeof v === 'object' ? v : {};
+    },
+    setCustomStages: function (obj) { set('bc.stages', obj || {}); },
   };
 })();
 
@@ -755,16 +762,26 @@
 // small canvas registered as the 'tiles' tileset.
 (function () {
   // ---------------------------------------------------------------- palettes
-  // NES-style two-tone bodies; 't' is near-black so the alternating track rows
-  // read as the classic notched treads with gaps
+  // Exact NES hardware colors, using the sprite palettes Battle City assigns
+  // (tbl_D555 in the disassembly):
+  //   pal0 player 1 = $0F,$18,$27,$38   pal1 player 2 = $0F,$0A,$1B,$3B
+  //   pal2 enemy    = $0F,$0C,$10,$20   pal3 red/flash = $0F,$04,$16,$20
+  // C = lightest, A = mid, B = darkest; T/t are the tread rows.
+  const NES = {
+    black: '#000000',
+    c04: '#940084', c0A: '#00a800', c0C: '#004058', c10: '#bcbcbc',
+    c16: '#f83800', c18: '#ac7c00', c1B: '#00a844', c20: '#f8f8f8',
+    c27: '#fca044', c38: '#f8d878', c3B: '#b8f8d8',
+  };
   const PAL = {
-    player: { A: '#d8a038', B: '#805010', C: '#f8e0a0', T: '#a87828', t: '#2c2008' },
-    player2: { A: '#48a048', B: '#145814', C: '#b8e8b0', T: '#389038', t: '#062806' },
-    enemy: { A: '#a8a8a8', B: '#505050', C: '#e8e8e8', T: '#909090', t: '#1c1c1c' },
-    red: { A: '#d04828', B: '#701008', C: '#f8a888', T: '#b03820', t: '#300400' },
-    h4: { A: '#48a848', B: '#106010', C: '#b0e8b0', T: '#389038', t: '#042c04' },
-    h3: { A: '#c0a828', B: '#685808', C: '#f0e090', T: '#a89020', t: '#2c2600' },
-    h2: { A: '#c8c8c8', B: '#686868', C: '#f8f8f8', T: '#b0b0b0', t: '#303030' },
+    player: { C: NES.c38, A: NES.c27, B: NES.c18, T: NES.c27, t: NES.black },
+    player2: { C: NES.c3B, A: NES.c1B, B: NES.c0A, T: NES.c1B, t: NES.black },
+    enemy: { C: NES.c20, A: NES.c10, B: NES.c0C, T: NES.c10, t: NES.black },
+    red: { C: NES.c20, A: NES.c16, B: NES.c04, T: NES.c16, t: NES.black },
+    // armor-tank damage palettes: the original flickers green/gold/silver
+    h4: { C: NES.c3B, A: NES.c1B, B: NES.c0A, T: NES.c1B, t: NES.black },
+    h3: { C: NES.c38, A: NES.c27, B: NES.c18, T: NES.c27, t: NES.black },
+    h2: { C: NES.c20, A: NES.c10, B: NES.c0C, T: NES.c10, t: NES.black },
   };
 
   // -------------------------------------------------------------- tank hulls
@@ -2309,6 +2326,14 @@
     '.............',
   ];
 
+  // Subtile map format (26 rows x 26 chars, one char per 8px cell) - the same
+  // encoding used by common Battle City clones, so stage files can be pasted
+  // straight in. See BC.importStage below.
+  BC.SUBTILE_CHARS = {
+    '.': BC.T.EMPTY, ' ': BC.T.EMPTY,
+    '#': BC.T.BRICK, '@': BC.T.STEEL, '%': BC.T.TREES, '~': BC.T.WATER, '-': BC.T.ICE,
+  };
+
   BC.levels = {
     TEST_MAP: TEST_MAP,
     // Highest stage number with an authored map
@@ -2324,48 +2349,70 @@
 })();
 
 // ==== src/data/waves.js ====
-// Enemy roster per authored stage: [basic, fast, power, armor], sums to 20.
-// Beyond the authored table, difficulty.js computes the roster.
+// Per-stage enemy composition, decoded from the NES ROM tables
+// (tbl_E4EC_stage_enemies + tbl_E578_stage_enemies_type_counter).
+// Each stage is FOUR ORDERED GROUPS of [type, count]; the 20 enemies spawn
+// group by group, not interleaved - the original never resets the group
+// pointer mid-stage. Type: 0 basic, 1 fast, 2 power, 3 armor.
+// A type can legitimately appear in two groups (e.g. stages 7, 11, 31, 33).
 (function () {
   const W = [];
-  W[1] = [18, 2, 0, 0];
-  W[2] = [14, 4, 0, 2];
-  W[3] = [14, 4, 2, 0];
-  W[4] = [2, 5, 10, 3];
-  W[5] = [8, 5, 5, 2];
-  W[6] = [9, 2, 7, 2];
-  W[7] = [7, 4, 6, 3];
-  W[8] = [7, 4, 7, 2];
-  W[9] = [6, 4, 7, 3];
-  W[10] = [12, 2, 4, 2];
-  W[11] = [5, 5, 6, 4];
-  W[12] = [0, 6, 8, 6];
-  W[13] = [0, 8, 8, 4];
-  W[14] = [0, 4, 10, 6];
-  W[15] = [0, 2, 10, 8];
-  W[16] = [16, 2, 0, 2];
-  W[17] = [8, 2, 8, 2];
-  W[18] = [2, 8, 6, 4];
-  W[19] = [0, 4, 10, 6];
-  W[20] = [0, 4, 8, 8];
-  W[21] = [0, 6, 8, 6];
-  W[22] = [0, 8, 8, 4];
-  W[23] = [0, 8, 8, 4];
-  W[24] = [0, 10, 4, 6];
-  W[25] = [0, 4, 8, 8];
-  W[26] = [0, 2, 8, 10];
-  W[27] = [0, 2, 8, 10];
-  W[28] = [0, 8, 2, 10];
-  W[29] = [0, 4, 4, 12];
-  W[30] = [0, 4, 4, 12];
-  W[31] = [0, 6, 4, 10];
-  W[32] = [0, 2, 8, 10];
-  W[33] = [0, 4, 4, 12];
-  W[34] = [0, 2, 4, 14];
-  W[35] = [0, 2, 2, 16];
+  W[1] = [[0, 18], [1, 2], [2, 0], [3, 0]];
+  W[2] = [[3, 2], [1, 4], [2, 0], [0, 14]];
+  W[3] = [[0, 14], [1, 4], [2, 0], [3, 2]];
+  W[4] = [[2, 10], [1, 5], [0, 2], [3, 3]];
+  W[5] = [[2, 5], [3, 2], [0, 8], [1, 5]];
+  W[6] = [[2, 7], [1, 2], [0, 9], [3, 2]];
+  W[7] = [[0, 3], [1, 4], [2, 6], [0, 7]];
+  W[8] = [[2, 7], [3, 2], [1, 4], [0, 7]];
+  W[9] = [[0, 6], [1, 4], [2, 7], [3, 3]];
+  W[10] = [[0, 12], [1, 2], [2, 4], [3, 2]];
+  W[11] = [[1, 5], [3, 6], [2, 4], [1, 5]];
+  W[12] = [[2, 8], [1, 6], [0, 0], [3, 6]];
+  W[13] = [[2, 8], [1, 8], [0, 0], [3, 4]];
+  W[14] = [[2, 10], [1, 4], [0, 0], [3, 6]];
+  W[15] = [[0, 2], [2, 0], [1, 10], [3, 8]];
+  W[16] = [[0, 16], [2, 0], [1, 2], [3, 2]];
+  W[17] = [[3, 2], [1, 2], [2, 8], [0, 8]];
+  W[18] = [[3, 4], [0, 2], [2, 6], [1, 8]];
+  W[19] = [[1, 4], [3, 8], [0, 4], [2, 4]];
+  W[20] = [[1, 8], [0, 2], [2, 2], [3, 8]];
+  W[21] = [[2, 8], [1, 2], [0, 6], [3, 4]];
+  W[22] = [[1, 8], [0, 6], [2, 2], [3, 4]];
+  W[23] = [[3, 6], [0, 0], [2, 4], [1, 10]];
+  W[24] = [[2, 4], [3, 2], [1, 4], [0, 10]];
+  W[25] = [[2, 2], [1, 8], [0, 0], [3, 10]];
+  W[26] = [[1, 6], [3, 6], [0, 4], [2, 4]];
+  W[27] = [[2, 2], [3, 8], [1, 8], [0, 2]];
+  W[28] = [[1, 2], [3, 1], [0, 15], [2, 2]];
+  W[29] = [[2, 10], [1, 4], [0, 0], [3, 6]];
+  W[30] = [[0, 4], [1, 8], [2, 4], [3, 4]];
+  W[31] = [[2, 3], [1, 8], [3, 6], [2, 3]];
+  W[32] = [[3, 8], [0, 6], [2, 2], [1, 4]];
+  W[33] = [[1, 4], [3, 8], [2, 4], [1, 4]];
+  W[34] = [[2, 4], [1, 10], [0, 0], [3, 6]];
+  W[35] = [[2, 4], [1, 6], [0, 0], [3, 10]];
 
   BC.waves = {
-    get: function (n) { return W[n] || null; },
+    // ordered [type, count] groups, or null when the stage has no ROM entry
+    getGroups: function (n) { return W[n] || null; },
+    // flat [basic, fast, power, armor] totals (for the gallery/tally)
+    get: function (n) {
+      const g = W[n];
+      if (!g) return null;
+      const t = [0, 0, 0, 0];
+      for (const [type, count] of g) t[type] += count;
+      return t;
+    },
+    // build the 20-tank spawn queue: whole group, then the next
+    queue: function (groups) {
+      const q = [];
+      for (const [type, count] of groups) {
+        for (let i = 0; i < count && q.length < 20; i++) q.push(type);
+      }
+      while (q.length < 20) q.push(BC.ENEMY.BASIC);
+      return q;
+    },
   };
 })();
 
@@ -2394,6 +2441,11 @@
 
     return {
       roster: [basic, fast, power, armor],
+      // ordered groups for the spawn queue (armor first late on, like the ROM's
+      // harder stages, so the wave opens with its toughest block)
+      groups: n >= 20
+        ? [[3, armor], [2, power], [1, fast], [0, basic]]
+        : [[0, basic], [2, power], [1, fast], [3, armor]],
       maxConcurrent: 4,          // 4 in 1P; GameScene raises to 6 in 2P (NES-exact)
       spawnDelayMs: Math.round(spawnFrames * 1000 / 60),
       spawnFrames: spawnFrames,  // the AI phase clock derives from this (see enemy.js)
@@ -2500,8 +2552,17 @@
 
     loadStage(mapStrings) {
       this.grid.fill(T.EMPTY);
-      // authored 13x13 tiles -> 26x26 subtiles
-      if (mapStrings) {
+      if (mapStrings && mapStrings.length >= 26) {
+        // subtile format: 26 rows x 26 chars, one char per 8px cell
+        for (let sy = 0; sy < 26; sy++) {
+          const row = mapStrings[sy] || '';
+          for (let sx = 0; sx < 26; sx++) {
+            const v = BC.SUBTILE_CHARS[row[sx]];
+            if (v !== undefined) this.grid[sy * G + sx] = v;
+          }
+        }
+      } else if (mapStrings) {
+        // authored 13x13 tiles -> 26x26 subtiles
         for (let ty = 0; ty < 13; ty++) {
           const row = mapStrings[ty] || '';
           for (let tx = 0; tx < 13; tx++) {
@@ -2823,12 +2884,47 @@
     },
   };
 
-  // Unified stage access: authored map + roster, or generated
+  // Imported stages (see BC.importStage) win over authored/generated ones
+  BC.customStages = BC.storage.getCustomStages();
+
+  // Unified stage access: imported map, authored map + roster, or generated
+  // roster = ordered [type, count] groups (see waves.js)
+  function rosterFor(n) {
+    return BC.waves.getGroups(n) || BC.difficulty(n).groups;
+  }
+
   BC.getStage = function (n) {
-    if (BC.levels.has(n)) {
-      return { map: BC.levels.getMap(n), roster: BC.waves.get(n) || BC.difficulty(n).roster };
+    const custom = BC.customStages && BC.customStages[n];
+    if (custom) return { map: custom, roster: rosterFor(n) };
+    if (BC.levels.has(n)) return { map: BC.levels.getMap(n), roster: rosterFor(n) };
+    return { map: BC.generator.generate(n), roster: rosterFor(n) };
+  };
+
+  // Load your own stage layouts. `text` is 26 lines of 26 characters:
+  //   .  empty    #  brick    @  steel    %  trees    ~  water    -  ice
+  // The eagle, its wall and the spawn points are stamped by the game, so you
+  // can leave those cells empty. Imported stages are saved in this browser.
+  //   BC.importStage(1, `...26 lines...`)   -> replace stage 1
+  //   BC.importStage(1, null)               -> restore the built-in stage
+  //   BC.clearImportedStages()              -> restore all
+  BC.importStage = function (n, text) {
+    if (!BC.customStages) BC.customStages = {};
+    if (!text) {
+      delete BC.customStages[n];
+    } else {
+      const rows = String(text).replace(/\r/g, '').split('\n')
+        .map((r) => r.replace(/\s+$/, '')).filter((r) => r.length);
+      if (rows.length < 26) throw new Error('need 26 rows, got ' + rows.length);
+      BC.customStages[n] = rows.slice(0, 26).map((r) => (r + '..........................').slice(0, 26));
     }
-    return { map: BC.generator.generate(n), roster: BC.difficulty(n).roster };
+    BC.storage.setCustomStages(BC.customStages);
+    return 'stage ' + n + (text ? ' imported' : ' restored');
+  };
+
+  BC.clearImportedStages = function () {
+    BC.customStages = {};
+    BC.storage.setCustomStages({});
+    return 'all stages restored';
   };
 })();
 
@@ -3329,21 +3425,9 @@
       this.pendingFlickers = 0;
       this.flashingSet = scene.testMode ? FLASHING_TEST : FLASHING;
 
-      // interleave roster types round-robin so the mix spreads across the wave
-      this.queue = [];
-      const counts = roster.slice();
-      while (this.queue.length < 20) {
-        let placed = false;
-        for (let t = 0; t < 4; t++) {
-          if (counts[t] > 0) {
-            this.queue.push(t);
-            counts[t] -= 1;
-            placed = true;
-            if (this.queue.length >= 20) break;
-          }
-        }
-        if (!placed) { this.queue.push(BC.ENEMY.BASIC); }
-      }
+      // NES order: the whole first group spawns, then the next, and so on
+      // (roster arrives as ordered [type, count] groups from BC.getStage)
+      this.queue = BC.waves.queue(roster);
     }
 
     remaining() {
@@ -3396,7 +3480,11 @@
       } else if (Math.random() < this.cfg.armorChance) {
         armor = 1 + Math.floor(Math.random() * this.cfg.armorMaxLayers);
       }
-      this._flickerThenSpawn(chosen.cx, chosen.cy, this.queue[idx], this.flashingSet.indexOf(idx) !== -1, armor, idx);
+      const flashing = this.flashingSet.indexOf(idx) !== -1;
+      // ROM hides any uncollected item the moment a bonus spawn is committed,
+      // not when the tank finally materializes
+      if (flashing) this.scene.powerups.removeExisting();
+      this._flickerThenSpawn(chosen.cx, chosen.cy, this.queue[idx], flashing, armor, idx);
       this.scene.events.emit('hud');
     }
 
@@ -3433,8 +3521,6 @@
         star.destroy();
         this.pendingFlickers -= 1;
         const e = new BC.Enemy(scene, this.terrain, cx, cy, type, flashing, this.cfg, armorLayers, index);
-        // flashing bonus tank replaces any uncollected power-up
-        if (flashing) scene.powerups.removeExisting();
         this.enemies.push(e);
       };
 
@@ -3588,8 +3674,14 @@
         for (const p of scene.players) {
           if (!p || !p.alive || p === b.owner) continue;
           if (overlapsTank(b, p)) {
-            scene.bullets.kill(b, true);
-            if (!p.isShielded() && scene.playTime >= p.stunnedUntil) p.stun(4400);
+            // ROM: a shielded absorb removes the bullet silently; a landed hit
+            // explodes
+            if (p.isShielded()) {
+              scene.bullets.kill(b, false);
+            } else {
+              scene.bullets.kill(b, true);
+              if (scene.playTime >= p.stunnedUntil) p.stun(4400);
+            }
             return true;
           }
         }
@@ -3598,9 +3690,9 @@
           if (!p || !p.alive) continue;
           if (overlapsTank(b, p)) {
             if (p.isShielded()) {
-              scene.bullets.kill(b, true);
+              scene.bullets.kill(b, false); // absorbed silently
             } else {
-              scene.bullets.kill(b, false);
+              scene.bullets.kill(b, true);  // explodes on the kill
               p.hit();
             }
             return true;
@@ -3610,7 +3702,9 @@
       return false;
     },
 
-    // Player bullets cancel enemy bullets (called once per frame)
+    // Player bullets cancel any other tank's bullet - including the other
+    // player's in 2P (the ROM only skips the same tank's own second slot).
+    // Both vanish silently.
     bulletsVsBullets: function (scene) {
       const list = scene.bullets.active;
       for (let i = 0; i < list.length; i++) {
@@ -3618,7 +3712,7 @@
         if (!a.alive || !a.fromPlayer) continue;
         for (let j = 0; j < list.length; j++) {
           const b = list[j];
-          if (!b.alive || b.fromPlayer) continue;
+          if (!b.alive || b === a || b.owner === a.owner) continue;
           if (Math.abs(a.x - b.x) < 6 && Math.abs(a.y - b.y) < 6) {
             scene.bullets.kill(a, false);
             scene.bullets.kill(b, false);
@@ -3657,20 +3751,21 @@
 
     spawn(forcedType) {
       this.removeExisting();
-      const type = forcedType !== undefined ? forcedType : Math.floor(Math.random() * 6);
-      // NES drop grid: 16 fixed spots (X and Y each from 48/96/144/192,
-      // top-left), re-rolled while the spot is unreachable
-      const SPOTS = [56, 104, 152, 200];
-      let fx = 104, fy = 104;
+      // ROM weights (tbl_E8FA): star and grenade appear twice in the 8-entry
+      // table, so they are 2/8 each and the rest 1/8
+      const TBL = [0, 1, 2, 3, 4, 5, 4, 3];
+      const type = forcedType !== undefined ? forcedType : TBL[Math.floor(Math.random() * 8)];
+      // NES drop grid: 16 fixed spots, centres at 32/80/128/176 in field px.
+      // The ROM re-rolls only when a player is already standing there (an item
+      // may legitimately land on water or steel and be unreachable).
+      const SPOTS = [32, 80, 128, 176];
+      let fx = 128, fy = 128;
       for (let tries = 0; tries < 24; tries++) {
         const cx = SPOTS[Math.floor(Math.random() * 4)];
         const cy = SPOTS[Math.floor(Math.random() * 4)];
-        let ok = true;
-        for (const [dx, dy] of [[-1, -1], [0, -1], [-1, 0], [0, 0]]) {
-          const v = this.terrain.get(cx / 8 + dx, cy / 8 + dy);
-          if (v === BC.T.WATER || v === BC.T.STEEL || v === BC.T.EAGLE) { ok = false; break; }
-        }
-        if (ok) { fx = cx; fy = cy; break; }
+        const taken = this.scene.players.some((p) =>
+          p && p.alive && Math.abs(p.x - cx) < 12 && Math.abs(p.y - cy) < 12);
+        if (!taken) { fx = cx; fy = cy; break; }
       }
       const sprite = this.scene.add.sprite(this.scene.fieldOx + fx, this.scene.fieldOy + fy, 'atlas', 'pw' + type)
         .setDepth(BC.DEPTH.POWERUP);
@@ -3681,7 +3776,8 @@
     update(dt) {
       if (!this.current) return;
       this.blink += dt * 1000;
-      this.current.sprite.setVisible(Math.floor(this.blink / 250) % 2 === 0);
+      // ROM: hidden for 8 frames, shown for 8 (frame & $08) - a 16-frame period
+      this.current.sprite.setVisible(Math.floor(this.blink / (8000 / 60)) % 2 === 1);
       const c = this.current;
       // players get pickup priority within the same frame
       for (const p of this.scene.players) {
@@ -3795,9 +3891,9 @@
         terrain.shellBrick();
         return 0;
       }
-      if (left < 2000) {
-        // blink steel/brick as a warning
-        const phase = Math.floor(left / 250) % 2 === 0;
+      if (left < 3200) {
+        // ROM: last 3 ticks blink, toggling every 16 frames (~267ms)
+        const phase = Math.floor(left / (16000 / 60)) % 2 === 0;
         if (phase !== this._blinkPhase) {
           this._blinkPhase = phase;
           if (phase) terrain.shellBrick();

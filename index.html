@@ -99,13 +99,17 @@
   BC.POWERUP_SCORE = 500;
   BC.EXTRA_LIFE_SCORE = 20000;
 
-  // Speeds are NES-exact (disassembly): px/frame x 60 on the same 208px field.
+  // Speeds are NES-exact (disassembly): a bullet or tank moves by exactly 1px
+  // on frames that pass its parity gate (sub_DBF1_tank_movement / sub_E604_
+  // bullets_movement); speed is entirely how often that gate opens. Slow
+  // bullets open it every other frame (30.05 =~ 30px/s); fast bullets open it
+  // every frame (60.1 =~ 60px/s) - the same two rates as the enemy tanks.
   BC.PLAYER_SPEED = 45;      // 0.75 px/frame, all tiers (upgrades never change speed)
-  BC.BULLET_SPEED = 120;     // slow bullet: 2 px/frame
-  BC.BULLET_SPEED_FAST = 240; // fast bullet: 4 px/frame
+  BC.BULLET_SPEED = 30;      // slow bullet: 0.5 px/frame
+  BC.BULLET_SPEED_FAST = 60; // fast bullet: 1 px/frame
   // Star tiers per the original: 0 slow shot, 1+ fast shot, 2+ two bullets,
   // 3 breaks steel. Tank 1990: the player spawns with one star.
-  BC.PLAYER_BULLET_SPEED = [120, 240, 240, 240];
+  BC.PLAYER_BULLET_SPEED = [30, 60, 60, 60];
   BC.PLAYER_START_TIER = 1;
 
   // Spawn positions in subtile coords (top-left corner of the 2x2 tank cell)
@@ -121,7 +125,7 @@
 
   // Build version, exchanged in the online handshake: both players must run
   // the same build so locally-constructed stages match the host's simulation.
-  BC.VERSION = '5.8';
+  BC.VERSION = '5.9';
 
   // Live per-run state (reset by GameScene on new game)
   BC.session = null;
@@ -2829,17 +2833,32 @@
 // The file is read locally in the browser and never uploaded; no original
 // level data ships with this game.
 //
-// Format (from the ROM's own draw routine, sub_F000_draw_stage):
-//   tbl_F07A_stage_data holds 36 entries (35 stages + the attract-mode stage)
-//   of 91 bytes each, at a fixed stride - no pointer table.
-//   Each entry is 13 rows x 7 bytes; each row is 14 nibbles, high nibble
-//   first: 13 blocks of 16x16 px plus one padding nibble (always 0x0D).
-//   A nibble is one 16px block, and half-block values expand losslessly into
-//   the 2x2 group of 8px cells our terrain grid uses.
+// Format (from the ROM's own draw routine, sub_F000_draw_stage / $EF80-$EFFC):
+//   A stage entry is 91 bytes: 13 rows x 14 nibbles, high nibble first.
+//   The first 13 nibbles of a row are 13 blocks of 16x16 px; the 14th is
+//   never drawn. A nibble is one block, and half-block values expand
+//   losslessly into the 2x2 group of 8px cells our terrain grid uses.
+//   Entries sit back to back at a fixed 91-byte stride - no pointer table.
+//
+// Finding the table is the hard part, because carts disagree about where it
+// lives. We try three strategies, most trustworthy first:
+//   1. the cart's own dispatch table at $E42B - 3-byte {ptr_lo, ptr_hi, count}
+//      entries that the draw routine indexes by ($46 & 0x0F). This is read
+//      from the ROM's data rather than guessed, so it wins when it validates.
+//   2. the stock cartridge offset, a fixed distance from the end of PRG.
+//   3. an exhaustive scan for a run of entries that decode as stages.
+//
+// Do NOT validate on the 14th nibble of a row. The stock cart leaves 0x0D
+// there, but hacked carts leave whatever their level editor wrote, and
+// requiring 0x0D is exactly what used to make those carts unreadable.
 (function () {
   const STAGE_BYTES = 91;
-  const STAGE_COUNT = 36;      // 35 stages + demo
-  const TABLE_FROM_PRG_END = 0x0F86; // table start = prgStart + prgSize - this
+  const STAGE_COUNT = 36;            // 35 stages + the attract-mode stage
+  const TABLE_FROM_PRG_END = 0x0F86; // stock cartridge layout
+  const DISPATCH_CPU = 0xE42B;       // {ptr_lo, ptr_hi, count} entries
+  const MIN_SET = 8;                 // smallest believable stage set
+  const MAX_SET = 64;                // larger than this is not a stage count
+  const MIN_POCKET = 0.6;            // share of entries that must clear the base
 
   // nibble -> 2x2 cells [[TL, TR], [BL, BR]] as map characters
   function expand(v) {
@@ -2857,37 +2876,146 @@
     if (v === 0x0A) return [['~', '~'], ['~', '~']];
     if (v === 0x0B) return [['%', '%'], ['%', '%']];
     if (v === 0x0C) return [['-', '-'], ['-', '-']];
-    return [[E, E], [E, E]]; // 0x0D empty (0x0E/0x0F unused)
+    return [[E, E], [E, E]]; // 0x0D empty (0x0E/0x0F are not drawable)
   }
 
-  function tableLooksRight(rom, off) {
-    if (off < 0 || off + STAGE_COUNT * STAGE_BYTES > rom.length) return false;
-    for (let s = 0; s < STAGE_COUNT; s++) {
-      for (let r = 0; r < 13; r++) {
-        const base = off + s * STAGE_BYTES + r * 7;
-        if ((rom[base + 6] & 0x0F) !== 0x0D) return false; // row padding nibble
-        for (let i = 0; i < 7; i++) {
-          if ((rom[base + i] >> 4) >= 0x0E) return false;
-          if (i < 6 && (rom[base + i] & 0x0F) >= 0x0E) return false;
-        }
-      }
+  function nib(rom, base, k) {
+    const b = rom[base + (k >> 1)];
+    return (k & 1) === 0 ? (b >> 4) : (b & 0x0F);
+  }
+
+  // Where PRG lives, and how the CPU sees it. The last 16K bank is mapped at
+  // $C000-$FFFF; $8000-$BFFF is the first bank on a 32K cart and mirrors the
+  // last bank on a 16K one.
+  function romLayout(rom) {
+    const isINes = rom[0] === 0x4E && rom[1] === 0x45 && rom[2] === 0x53 && rom[3] === 0x1A;
+    let prgStart = 0;
+    let prgSize = rom.length;
+    if (isINes) {
+      prgStart = 16 + ((rom[6] & 0x04) ? 512 : 0);
+      prgSize = rom[4] * 16384;
+      if (!prgSize || prgStart + prgSize > rom.length) prgSize = rom.length - prgStart;
+    }
+    const prgEnd = prgStart + prgSize;
+    const bankHi = prgSize >= 16384 ? prgEnd - 16384 : prgStart;
+    const bankLo = prgSize >= 32768 ? prgStart : bankHi;
+    return {
+      prgStart,
+      prgEnd,
+      fileOf(cpu) {
+        if (cpu < 0x8000 || cpu > 0xFFFF) return -1;
+        const o = cpu >= 0xC000 ? bankHi + (cpu - 0xC000) : bankLo + (cpu - 0x8000);
+        return (o >= prgStart && o + STAGE_BYTES <= prgEnd) ? o : -1;
+      },
+    };
+  }
+
+  // Structural test: the renderer can only draw nibbles 0x00-0x0D, so anything
+  // else in the 13x13 field means this is not a stage.
+  function drawable(rom, base, end) {
+    if (base < 0 || base + STAGE_BYTES > end) return false;
+    for (let r = 0; r < 13; r++) {
+      for (let c = 0; c < 13; c++) if (nib(rom, base, r * 14 + c) > 0x0D) return false;
     }
     return true;
   }
 
+  // The eagle sits in blocks rows 11-12, cols 5-7, so real stages leave that
+  // pocket empty. A few hacked stages do not, which is why this is scored
+  // across the table instead of required per entry.
+  function pocketClear(rom, base) {
+    for (let r = 11; r <= 12; r++) {
+      for (let c = 5; c <= 7; c++) if (nib(rom, base, r * 14 + c) !== 0x0D) return false;
+    }
+    return true;
+  }
+
+  // -1 rejects; otherwise higher is a better candidate table.
+  function scoreTable(rom, off, count, end) {
+    if (off < 0 || count < 1 || off + count * STAGE_BYTES > end) return -1;
+    let pockets = 0;
+    let empty = 0;
+    let total = 0;
+    const seen = {};
+    let kinds = 0;
+    for (let s = 0; s < count; s++) {
+      const base = off + s * STAGE_BYTES;
+      if (!drawable(rom, base, end)) return -1;
+      if (pocketClear(rom, base)) pockets++;
+      for (let r = 0; r < 13; r++) {
+        for (let c = 0; c < 13; c++) {
+          const v = nib(rom, base, r * 14 + c);
+          total++;
+          if (v === 0x0D) empty++;
+          if (!seen[v]) { seen[v] = 1; kinds++; }
+        }
+      }
+    }
+    if (pockets < Math.ceil(count * MIN_POCKET)) return -1;
+    const emptyShare = empty / total;
+    if (emptyShare < 0.15 || emptyShare > 0.85) return -1;  // solid or blank walls of data
+    if (kinds < 3) return -1;                               // needs real terrain variety
+    return pockets / count;
+  }
+
+  // Strategy 1: the cart tells us where its stage sets are.
+  function fromDispatch(rom, L) {
+    const at = L.fileOf(DISPATCH_CPU);
+    if (at < 0) return null;
+    let best = null;
+    for (let i = 0; i < 16; i++) {
+      const e = at + i * 3;
+      if (e + 3 > L.prgEnd) break;
+      const addr = rom[e] | (rom[e + 1] << 8);
+      const count = rom[e + 2];
+      // the table is not terminated - it simply runs into code, so the first
+      // entry that cannot be a stage set marks the end
+      if (addr < 0x8000 || count < MIN_SET || count > MAX_SET) break;
+      const off = L.fileOf(addr);
+      if (off < 0 || off + count * STAGE_BYTES > L.prgEnd) break;
+      const score = scoreTable(rom, off, Math.min(count, STAGE_COUNT), L.prgEnd);
+      if (score < 0) continue;
+      // prefer the widest set - that is the "all stages" entry
+      if (!best || count > best.count || (count === best.count && off < best.offset)) {
+        best = { offset: off, count, score, via: 'dispatch' };
+      }
+    }
+    return best;
+  }
+
+  // Strategy 2: the stock cartridge put the table a fixed distance from the end.
+  function fromStockOffset(rom, L) {
+    const off = L.prgEnd - TABLE_FROM_PRG_END;
+    const score = scoreTable(rom, off, STAGE_COUNT, L.prgEnd);
+    return score < 0 ? null : { offset: off, count: STAGE_COUNT, score, via: 'stock' };
+  }
+
+  // Strategy 3: last resort - find the best run of STAGE_COUNT entries anywhere.
+  function fromScan(rom, L) {
+    const span = L.prgEnd - L.prgStart;
+    if (span < STAGE_COUNT * STAGE_BYTES) return null;
+    const ok = new Uint8Array(span);
+    for (let o = L.prgStart; o + STAGE_BYTES <= L.prgEnd; o++) {
+      ok[o - L.prgStart] = drawable(rom, o, L.prgEnd) ? 1 : 0;
+    }
+    let best = null;
+    const last = L.prgEnd - STAGE_COUNT * STAGE_BYTES;
+    for (let o = L.prgStart; o <= last; o++) {
+      let run = 0;
+      while (run < STAGE_COUNT && ok[o - L.prgStart + run * STAGE_BYTES]) run++;
+      if (run < STAGE_COUNT) continue;
+      const score = scoreTable(rom, o, STAGE_COUNT, L.prgEnd);
+      if (score < 0) continue;
+      if (!best || score > best.score) best = { offset: o, count: STAGE_COUNT, score, via: 'scan' };
+    }
+    return best;
+  }
+
+  // Most trustworthy strategy first; the first one that validates wins, so a
+  // lucky-looking scan hit can never outrank the cart's own dispatch table.
   function findTable(rom) {
-    const isINes = rom[0] === 0x4E && rom[1] === 0x45 && rom[2] === 0x53 && rom[3] === 0x1A;
-    if (isINes) {
-      const prgStart = 16 + ((rom[6] & 0x04) ? 512 : 0);
-      const prgSize = rom[4] * 16384;
-      const off = prgStart + prgSize - TABLE_FROM_PRG_END;
-      if (tableLooksRight(rom, off)) return off;
-    }
-    // headerless dump or an odd variant: scan for a table that validates
-    for (let off = 0; off + STAGE_COUNT * STAGE_BYTES <= rom.length; off++) {
-      if (rom[off] === 0xDD && rom[off + 1] === 0xDD && tableLooksRight(rom, off)) return off;
-    }
-    return -1;
+    const L = romLayout(rom);
+    return fromDispatch(rom, L) || fromStockOffset(rom, L) || fromScan(rom, L) || null;
   }
 
   // decode one entry into 26 strings of 26 chars
@@ -2896,10 +3024,7 @@
     for (let i = 0; i < 26; i++) grid.push(new Array(26).fill('.'));
     for (let r = 0; r < 13; r++) {
       for (let c = 0; c < 13; c++) {
-        const k = r * 14 + c;                       // nibble index, 14 per row
-        const byte = rom[off + (k >> 1)];
-        const v = (k & 1) === 0 ? (byte >> 4) : (byte & 0x0F);
-        const q = expand(v);
+        const q = expand(nib(rom, off, r * 14 + c));
         grid[r * 2][c * 2] = q[0][0];
         grid[r * 2][c * 2 + 1] = q[0][1];
         grid[r * 2 + 1][c * 2] = q[1][0];
@@ -2933,35 +3058,56 @@
       return { ok: true, stages, count: Object.keys(stages).length };
     },
 
-    // returns { ok, error?, stages: { 1..35 }, demo }
+    // returns { ok, error?, stages: { 1..35 }, demo, offset, count, via }
     parse(buffer) {
       const rom = new Uint8Array(buffer);
-      const off = findTable(rom);
-      if (off < 0) {
+      const found = findTable(rom);
+      if (!found) {
         return { ok: false, error: 'NO STAGE DATA FOUND' };
       }
       const stages = {};
-      for (let n = 1; n <= 35; n++) {
-        stages[n] = decodeStage(rom, off + (n - 1) * STAGE_BYTES);
+      const playable = Math.min(35, found.count);
+      for (let n = 1; n <= playable; n++) {
+        stages[n] = decodeStage(rom, found.offset + (n - 1) * STAGE_BYTES);
       }
-      return { ok: true, stages, demo: decodeStage(rom, off + 35 * STAGE_BYTES), offset: off };
+      const res = {
+        ok: true,
+        stages,
+        count: playable,
+        offset: found.offset,
+        entries: found.count,
+        via: found.via,
+      };
+      if (found.count >= STAGE_COUNT) {
+        res.demo = decodeStage(rom, found.offset + (STAGE_COUNT - 1) * STAGE_BYTES);
+      }
+      return res;
     },
 
     // parse + save every stage; returns a short status string
     install(buffer) {
       const res = this.parse(buffer);
       if (!res.ok) return res;
-      for (let n = 1; n <= 35; n++) BC.importStage(n, res.stages[n].join('\n'));
-      return { ok: true, count: 35 };
+      let count = 0;
+      for (const k of Object.keys(res.stages)) {
+        BC.importStage(Number(k), res.stages[k].join('\n'));
+        count += 1;
+      }
+      return { ok: true, count };
     },
 
     // Install from a list of files: a full .nes ROM, or raw stage blobs.
     // Raw files are assigned by the first number in their name when present
     // (stage_07.bin -> stage 7), otherwise by selection order.
     installFiles(files) {
-      // a single large file is a ROM
-      const rom = files.find((f) => f.buffer.byteLength > 4096);
-      if (rom) return this.install(rom.buffer);
+      // a .nes file, or failing that any file too large to be a stage blob
+      const rom = files.find((f) => /\.nes$/i.test(f.name || ''))
+        || files.find((f) => f.buffer.byteLength > 4096);
+      if (rom) {
+        const res = this.install(rom.buffer);
+        // a ROM we could not read might still be a bare run of stage entries
+        if (res.ok || rom.buffer.byteLength % STAGE_BYTES !== 0) return res;
+      }
 
       const withNums = files
         .map((f, i) => {
@@ -3408,9 +3554,14 @@
     return BC.waves.getGroups(n) || BC.difficulty(n).groups;
   }
 
+  // Precedence: a map the player imported themselves, then any map baked into
+  // this build (the --local build ships the 35 originals in BC.bundledStages),
+  // then our authored map, then the generator.
   BC.getStage = function (n) {
     const custom = BC.customStages && BC.customStages[n];
     if (custom) return { map: custom, roster: rosterFor(n) };
+    const bundled = BC.bundledStages && BC.bundledStages[n];
+    if (bundled) return { map: bundled, roster: rosterFor(n) };
     if (BC.levels.has(n)) return { map: BC.levels.getMap(n), roster: rosterFor(n) };
     return { map: BC.generator.generate(n), roster: rosterFor(n) };
   };
@@ -4795,8 +4946,9 @@
     create() {
       BC.texgen.build(this.textures);
       BC.texgen.buildFont(this);
-      // a texture pack the player loaded earlier repaints the generated atlas
-      const pack = BC.texpack.stored();
+      // Repaint the generated atlas: a pack the player loaded themselves wins,
+      // otherwise whatever this build ships with (only the --local build does).
+      const pack = BC.texpack.stored() || BC.bundledTextures;
       if (pack && pack.length) {
         BC.texpack.applyFiles(pack, this.textures).catch(() => {});
       }
@@ -4997,9 +5149,11 @@
         this.pickRom();
       });
       this.root.add(rom);
-      // optional texture pack, loaded from the player's own image files
+      // optional texture pack, loaded from the player's own image files.
+      // A build that ships its own art (--local) says REPLACE, not LOAD.
       const hasPack = !!(BC.texpack.stored() || []).length;
-      const texLabel = hasPack ? 'CLEAR TEXTURE PACK' : 'LOAD TEXTURE PACK';
+      const texLabel = hasPack ? 'CLEAR TEXTURE PACK'
+        : (BC.bundledTextures ? 'REPLACE TEXTURE PACK' : 'LOAD TEXTURE PACK');
       const tex = BC.mkText(this, W / 2, botY + 56, texLabel, 7, '#909090')
         .setOrigin(0.5).setInteractive({ useHandCursor: true });
       tex.on('pointerdown', () => {

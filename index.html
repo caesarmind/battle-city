@@ -62,8 +62,13 @@
   BC.GRID = 26;            // field is 26x26 subtiles (13x13 tiles)
   BC.FIELD = BC.SUB * BC.GRID; // 208 logical px
 
-  // Terrain cell values (Uint8Array entries)
-  BC.T = { EMPTY: 0, BRICK: 1, STEEL: 2, WATER: 3, TREES: 4, ICE: 5, EAGLE: 6 };
+  // Terrain cell values (Uint8Array entries). An 8px brick cell takes TWO
+  // hits (NES rule): the first leaves the far half standing - BRICK_T/B/L/R
+  // name which half remains - and the second destroys it.
+  BC.T = {
+    EMPTY: 0, BRICK: 1, STEEL: 2, WATER: 3, TREES: 4, ICE: 5, EAGLE: 6,
+    BRICK_T: 7, BRICK_B: 8, BRICK_L: 9, BRICK_R: 10,
+  };
 
   // Render depths inside GameScene
   BC.DEPTH = {
@@ -116,7 +121,7 @@
 
   // Build version, exchanged in the online handshake: both players must run
   // the same build so locally-constructed stages match the host's simulation.
-  BC.VERSION = '5.0';
+  BC.VERSION = '5.1';
 
   // Live per-run state (reset by GameScene on new game)
   BC.session = null;
@@ -1408,9 +1413,10 @@
       }
 
       // ---- tileset canvas: index order must match BC.T values
-      // 0 empty, 1 brick, 2 steel, 3 water(A), 4 trees, 5 ice, 6 water(B)
+      // 0 empty, 1 brick, 2 steel, 3 water(A), 4 trees, 5 ice, 6 water(B),
+      // 7-10 half-damaged brick (top/bottom/left/right half remains)
       const tc = document.createElement('canvas');
-      tc.width = 8 * 7;
+      tc.width = 8 * 11;
       tc.height = 8;
       const tctx = tc.getContext('2d');
       drawArt(tctx, TILE_BRICK, TILE_BRICK_PAL, 8, 0);
@@ -1419,6 +1425,16 @@
       drawArt(tctx, TILE_TREES, TILE_TREES_PAL, 32, 0);
       drawArt(tctx, TILE_ICE, TILE_ICE_PAL, 40, 0);
       drawArt(tctx, TILE_WATER_B, TILE_WATER_PAL, 48, 0);
+      // half-bricks: full pattern with the destroyed half cleared
+      for (const [idx, cx, cy, cw, ch] of [
+        [7, 0, 4, 8, 4],  // top remains: clear bottom
+        [8, 0, 0, 8, 4],  // bottom remains: clear top
+        [9, 4, 0, 4, 8],  // left remains: clear right
+        [10, 0, 0, 4, 8], // right remains: clear left
+      ]) {
+        drawArt(tctx, TILE_BRICK, TILE_BRICK_PAL, idx * 8, 0);
+        tctx.clearRect(idx * 8 + cx, cy, cw, ch);
+      }
       textures.addCanvas('tiles', tc);
       // named frames so the gallery can show tile swatches
       const ttex = textures.get('tiles');
@@ -2464,17 +2480,22 @@
         else if (v === T.STEEL) idx = 2;
         else if (v === T.WATER) idx = this.waterFrame === 0 ? 3 : 6;
         else if (v === T.ICE) idx = 5;
+        else if (v >= T.BRICK_T && v <= T.BRICK_R) idx = v; // half-brick tiles 7-10
         // EMPTY and EAGLE render as blank (eagle is a sprite)
         this.ground.putTileAt(idx, sx, sy);
       }
     }
 
+    static isBrick(v) {
+      return v === T.BRICK || (v >= T.BRICK_T && v <= T.BRICK_R);
+    }
+
     static solidForTank(v) {
-      return v === T.BRICK || v === T.STEEL || v === T.WATER || v === T.EAGLE;
+      return BC.Terrain.isBrick(v) || v === T.STEEL || v === T.WATER || v === T.EAGLE;
     }
 
     static solidForBullet(v) {
-      return v === T.BRICK || v === T.STEEL || v === T.EAGLE;
+      return BC.Terrain.isBrick(v) || v === T.STEEL || v === T.EAGLE;
     }
 
     loadStage(mapStrings) {
@@ -2560,7 +2581,7 @@
       for (const [sx, sy] of cells) {
         const v = this.get(sx, sy);
         if (v === T.EAGLE) hitEagle = true;
-        else if (v === T.BRICK) hitBrick = true;
+        else if (BC.Terrain.isBrick(v)) hitBrick = true;
         else if (v === T.STEEL) hitSteel = true;
       }
       if (hitEagle) return 'eagle';
@@ -2568,15 +2589,16 @@
         // solid border (off-field cells report STEEL) - treat as bound
         return 'none';
       }
+      // which half survives a first hit = the far half along the bullet's travel
+      const remain = dv.x > 0 ? T.BRICK_R : dv.x < 0 ? T.BRICK_L
+        : dv.y > 0 ? T.BRICK_B : T.BRICK_T;
       for (const [sx, sy] of cells) {
         const v = this.get(sx, sy);
         if (v === T.BRICK) {
+          // NES rule: 2 hits per 8px cell (3-star bullets take the whole cell)
+          this.set(sx, sy, canBreakSteel ? T.EMPTY : remain);
+        } else if (v >= T.BRICK_T && v <= T.BRICK_R) {
           this.set(sx, sy, T.EMPTY);
-          if (canBreakSteel) {
-            // tier-3 bullets carve 2 deep through brick
-            const nx = sx + dv.x, ny = sy + dv.y;
-            if (this.get(nx, ny) === T.BRICK) this.set(nx, ny, T.EMPTY);
-          }
         } else if (v === T.STEEL && canBreakSteel && sx >= 0 && sy >= 0 && sx < G && sy < G) {
           this.set(sx, sy, T.EMPTY);
         }

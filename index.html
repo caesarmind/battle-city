@@ -5291,10 +5291,13 @@
         { cycle: ['tank_e2_n_0_0', 'tank_e2_n_0_1'], name: 'POWER', desc: '300 PTS. FAST BULLETS' },
         { cycle: ['tank_e3_h4_0_0', 'tank_e3_h4_0_1'], name: 'MASSIVE', desc: '400 PTS. 4HP TWIN GUN' },
         {
-          cycle: ['tank_e0_h4_0_0', 'tank_e0_h4_0_1', 'tank_e0_h3_0_0', 'tank_e0_h3_0_1',
-            'tank_e0_h2_0_0', 'tank_e0_h2_0_1', 'tank_e0_n_0_0', 'tank_e0_n_0_1'],
+          // the game flickers a palette PAIR per remaining HP (see enemy.js
+          // palettePair): 4hp green/silver, 3hp gold/silver, 2hp gold/green,
+          // 1hp plain silver. Cycle the real sequence so this matches play.
+          cycle: ['tank_e0_h4_0_0', 'tank_e0_n_0_1', 'tank_e0_h3_0_0', 'tank_e0_n_0_1',
+            'tank_e0_h3_0_0', 'tank_e0_h4_0_1', 'tank_e0_n_0_0', 'tank_e0_n_0_1'],
           name: 'ARMORED', desc: 'EXTRA HITS. ANY TANK',
-          swatches: ['tank_e0_h4_0_0', 'tank_e0_h3_0_0', 'tank_e0_h2_0_0', 'tank_e0_n_0_0'],
+          swatches: ['tank_e0_h4_0_0', 'tank_e0_h3_0_0', 'tank_e0_n_0_0'],
         },
         { cycle: ['tank_e0_r_0_0', 'tank_e0_r_0_1', 'tank_e0_n_0_0', 'tank_e0_n_0_1'], name: 'BONUS', desc: 'FLASHING. DROPS ITEM' },
       ],

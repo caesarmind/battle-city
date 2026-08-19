@@ -3913,6 +3913,24 @@
         pause: { x: 112, y: 256, w: 44, h: 18 },
       };
     }
+    if (BC.hasTouch()) {
+      // phone/tablet landscape: field centered, thumb zones in the side
+      // gutters - D-pad left, fire right, HUD split across both gutters
+      return {
+        mode: 'landscape-touch',
+        gameW: 400,
+        gameH: 240,
+        fieldOx: 96,
+        fieldOy: 16,
+        touch: {
+          dpad: { x: 48, y: 168, r: 44 },
+          fire: { x: 352, y: 172, r: 30 },
+        },
+        // right gutter, above the fire button and outside its touch radius
+        pause: { x: 352, y: 112, w: 44, h: 16 },
+      };
+    }
+    // desktop landscape: classic NES sidebar
     return {
       mode: 'landscape',
       gameW: 288,
@@ -4106,6 +4124,24 @@
           this.lives2Text = BC.mkText(scene, 178, 7, 'x3', 8, '#e8e8e8');
         }
         this.stageText = BC.mkText(scene, 216, 7, 'S1', 8, '#e8e8e8').setOrigin(1, 0);
+      } else if (L.mode === 'landscape-touch') {
+        // phone landscape: enemy count in the left gutter (above the D-pad),
+        // lives/stage/score stacked in the right gutter (above fire)
+        for (let i = 0; i < 20; i++) {
+          const ic = scene.add.image(30 + (i % 2) * 9, 18 + Math.floor(i / 2) * 9, 'atlas', 'icon_enemy_w').setOrigin(0, 0);
+          this.icons.push(ic);
+        }
+        const rx = L.gameW - 84; // right gutter column
+        this.lifeIcon = scene.add.image(rx + 8, 18, 'atlas', 'icon_life').setOrigin(0, 0);
+        this.livesText = BC.mkText(scene, rx + 20, 18, 'x3', 8, '#e8e8e8');
+        if (this.p2) {
+          this.life2Icon = scene.add.image(rx + 8, 30, 'atlas', 'icon_life2').setOrigin(0, 0);
+          this.lives2Text = BC.mkText(scene, rx + 20, 30, 'x3', 8, '#e8e8e8');
+        }
+        scene.add.image(rx + 8, 44, 'atlas', 'icon_flag').setOrigin(0, 0);
+        this.stageText = BC.mkText(scene, rx + 26, 49, '1', 8, '#e8e8e8');
+        this.scoreText = BC.mkText(scene, rx + 2, 68, '0', 8, '#ffffff');
+        this.hiText = BC.mkText(scene, rx + 2, 80, '0', 8, '#909090');
       } else {
         const sx = L.sidebarX + 8;
         // enemy icon grid: 2 columns x 10
@@ -4613,10 +4649,12 @@
       const L = BC.layout;
       const W = L.gameW, H = L.gameH;
       const portrait = L.mode === 'portrait';
+      // on the wide phone-landscape canvas, center the 288px content block
+      const gx = L.mode === 'landscape-touch' ? Math.round((W - 288) / 2) : 0;
       const rowH = portrait ? 44 : 30;
       const top = portrait ? 46 : 32;
-      const spriteX = portrait ? 26 : 22;
-      const textX = portrait ? 48 : 42;
+      const spriteX = (portrait ? 26 : 22) + gx;
+      const textX = (portrait ? 48 : 42) + gx;
       const p = PAGES[this.page];
 
       const add = (o) => { this.root.add(o); return o; };

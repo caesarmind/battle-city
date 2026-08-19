@@ -121,7 +121,7 @@
 
   // Build version, exchanged in the online handshake: both players must run
   // the same build so locally-constructed stages match the host's simulation.
-  BC.VERSION = '5.5';
+  BC.VERSION = '5.6';
 
   // Live per-run state (reset by GameScene on new game)
   BC.session = null;
@@ -2560,6 +2560,24 @@
   }
 
   BC.romImport = {
+    STAGE_BYTES: STAGE_BYTES,
+
+    // Decode raw stage blobs: either one 91-byte stage file, or a run of them
+    // concatenated (e.g. the 3276-byte stage table lifted out of a ROM).
+    // `startStage` says which stage number the first entry maps to.
+    parseRaw(buffer, startStage) {
+      const data = new Uint8Array(buffer);
+      if (data.length < STAGE_BYTES || data.length % STAGE_BYTES !== 0) return null;
+      const count = data.length / STAGE_BYTES;
+      const stages = {};
+      for (let i = 0; i < count; i++) {
+        const n = (startStage || 1) + i;
+        if (n > 35) break;
+        stages[n] = decodeStage(data, i * STAGE_BYTES);
+      }
+      return { ok: true, stages, count: Object.keys(stages).length };
+    },
+
     // returns { ok, error?, stages: { 1..35 }, demo }
     parse(buffer) {
       const rom = new Uint8Array(buffer);
@@ -2580,6 +2598,33 @@
       if (!res.ok) return res;
       for (let n = 1; n <= 35; n++) BC.importStage(n, res.stages[n].join('\n'));
       return { ok: true, count: 35 };
+    },
+
+    // Install from a list of files: a full .nes ROM, or raw stage blobs.
+    // Raw files are assigned by the first number in their name when present
+    // (stage_07.bin -> stage 7), otherwise by selection order.
+    installFiles(files) {
+      // a single large file is a ROM
+      const rom = files.find((f) => f.buffer.byteLength > 4096);
+      if (rom) return this.install(rom.buffer);
+
+      const withNums = files
+        .map((f, i) => {
+          const m = /(\d+)/.exec(f.name || '');
+          return { f, n: m ? parseInt(m[1], 10) : i + 1 };
+        })
+        .sort((a, b) => a.n - b.n);
+      let count = 0;
+      for (const { f, n } of withNums) {
+        const res = this.parseRaw(f.buffer, n);
+        if (!res) continue;
+        for (const k of Object.keys(res.stages)) {
+          BC.importStage(Number(k), res.stages[k].join('\n'));
+          count += 1;
+        }
+      }
+      if (!count) return { ok: false, error: 'UNRECOGNISED FILE FORMAT' };
+      return { ok: true, count };
     },
   };
 })();
@@ -3121,20 +3166,14 @@
       }
       if (allowed <= 0) return 0;
 
-      // other tanks: clamp to touching. If two tanks somehow already
-      // intersect, movement toward the other is blocked and movement away is
-      // free, so overlaps always resolve instead of becoming pass-through.
+      // other tanks: clamp to touching. Tanks that ALREADY overlap - a fresh
+      // spawn landing on someone, say - pass freely through each other until
+      // they separate; blocking only starts once they no longer intersect.
       const r = this.rect();
       for (const t of tanks) {
         if (t === this || !t.alive || t.ghost) continue;
         const o = t.rect();
-        if (o.r > r.l && o.l < r.r && o.b > r.t && o.t < r.b) {
-          const toward = horiz
-            ? (dv.x > 0 ? t.x > this.x : t.x < this.x)
-            : (dv.y > 0 ? t.y > this.y : t.y < this.y);
-          if (toward) return 0;
-          continue;
-        }
+        if (o.r > r.l && o.l < r.r && o.b > r.t && o.t < r.b) continue;
         if (horiz) {
           if (o.b <= r.t || o.t >= r.b) continue;
           if (dv.x > 0 && o.l >= r.r) allowed = Math.min(allowed, o.l - r.r);
@@ -3174,13 +3213,15 @@
         if (wantDir !== this.dir) {
           const perpendicular = (wantDir % 2) !== (this.dir % 2);
           if (perpendicular) {
-            // snap cross-axis to the nearest 8px lane - but never snap INTO
-            // another tank (the snap can jump up to 4px)
+            // snap cross-axis to the nearest 8px lane - but don't snap INTO a
+            // tank we are not already overlapping (the snap jumps up to 4px)
             const nx = wantDir % 2 === 1 ? this.x : Math.round(this.x / 8) * 8;
             const ny = wantDir % 2 === 1 ? Math.round(this.y / 8) * 8 : this.y;
             let snapBlocked = false;
             for (const t of tanks) {
               if (t === this || !t.alive || t.ghost) continue;
+              const overlappingNow = Math.abs(t.x - this.x) < 16 && Math.abs(t.y - this.y) < 16;
+              if (overlappingNow) continue; // already sharing space: let it pass
               if (Math.abs(t.x - nx) < 16 && Math.abs(t.y - ny) < 16) { snapBlocked = true; break; }
             }
             if (snapBlocked) {
@@ -3568,22 +3609,13 @@
         this.timer = 100; // NES retries every frame once a slot frees
         return;
       }
-      // pick next clear spawn point (try all three before giving up this tick)
+      // spawn points cycle unconditionally (as in the original) - a tank
+      // standing on the pad does not delay the spawn; the new tank simply
+      // materializes and the two pass through each other until they separate
       const pts = BC.SPAWNS.enemies;
-      let chosen = null;
-      for (let i = 0; i < pts.length; i++) {
-        const p = pts[(this.pointIdx + i) % pts.length];
-        const cx = p.sx * 8 + 8, cy = p.sy * 8 + 8;
-        if (this._pointClear(cx, cy)) {
-          chosen = { cx, cy };
-          this.pointIdx = (this.pointIdx + i + 1) % pts.length;
-          break;
-        }
-      }
-      if (!chosen) {
-        this.timer = 500;
-        return;
-      }
+      const p = pts[this.pointIdx % pts.length];
+      const chosen = { cx: p.sx * 8 + 8, cy: p.sy * 8 + 8 };
+      this.pointIdx = (this.pointIdx + 1) % pts.length;
       const idx = this.spawnedCount;
       this.spawnedCount += 1;
       this.timer = this.cfg.spawnDelayMs;
@@ -3620,21 +3652,9 @@
       const seq = [0, 1, 2, 3, 2, 1, 2, 3, 2, 3];
 
       const materialize = () => {
-        if (scene.state !== 'play' && scene.state !== 'gameover') {
-          star.destroy();
-          this.pendingFlickers -= 1;
-          return;
-        }
-        // the pad may have been driven onto during the flicker: never
-        // materialize inside another tank - keep the star up and retry
-        if (!this._pointClear(cx, cy)) {
-          star.setFrame('spawn' + (step % 2 === 0 ? 2 : 3));
-          step += 1;
-          scene.time.delayedCall(250, materialize);
-          return;
-        }
         star.destroy();
         this.pendingFlickers -= 1;
+        if (scene.state !== 'play' && scene.state !== 'gameover') return;
         const e = new BC.Enemy(scene, this.terrain, cx, cy, type, flashing, this.cfg, armorLayers, index);
         this.enemies.push(e);
       };
@@ -4634,30 +4654,39 @@
     pickRom() {
       const input = document.createElement('input');
       input.type = 'file';
+      input.multiple = true; // a ROM, or a set of raw stage files
       input.accept = '.nes,.bin,application/octet-stream';
       input.style.display = 'none';
       document.body.appendChild(input);
       input.addEventListener('change', () => {
-        const file = input.files && input.files[0];
+        const files = Array.from(input.files || []);
         document.body.removeChild(input);
-        if (!file) return;
-        const reader = new FileReader();
-        reader.onload = () => {
-          let res;
-          try {
-            res = BC.romImport.install(reader.result);
-          } catch (e) {
-            res = { ok: false, error: 'COULD NOT READ FILE' };
-          }
+        if (!files.length) return;
+        const done = (res) => {
           this.romMsg = res.ok ? 'IMPORTED ' + res.count + ' MAPS!' : (res.error || 'IMPORT FAILED');
           BC.sfx.play(res.ok ? 'pwGet' : 'steel');
           this.buildUI();
         };
-        reader.onerror = () => {
-          this.romMsg = 'COULD NOT READ FILE';
-          this.buildUI();
-        };
-        reader.readAsArrayBuffer(file);
+        const loaded = [];
+        let pending = files.length;
+        let failed = false;
+        for (const file of files) {
+          const reader = new FileReader();
+          reader.onload = () => {
+            loaded.push({ name: file.name, buffer: reader.result });
+            if (--pending === 0 && !failed) {
+              try {
+                done(BC.romImport.installFiles(loaded));
+              } catch (e) {
+                done({ ok: false, error: 'COULD NOT READ FILES' });
+              }
+            }
+          };
+          reader.onerror = () => {
+            if (!failed) { failed = true; done({ ok: false, error: 'COULD NOT READ FILES' }); }
+          };
+          reader.readAsArrayBuffer(file);
+        }
       });
       input.click();
     }
@@ -5167,16 +5196,11 @@
         return;
       }
       if (st.lives > 0) {
-        // never respawn inside a tank camping the pad - wait it out
-        const sp = BC.SPAWNS.players[player.pIndex];
-        const cx = sp.sx * 8 + 8, cy = sp.sy * 8 + 8;
-        const tryRespawn = () => {
-          if (this.state !== 'play' && this.state !== 'clear') return;
-          const blocked = this.tanks().some((t) => Math.abs(t.x - cx) < 16 && Math.abs(t.y - cy) < 16);
-          if (blocked) { this.time.delayedCall(400, tryRespawn); return; }
-          player.respawn();
-        };
-        this.time.delayedCall(1200, tryRespawn);
+        // respawn on schedule even if something is sitting on the pad - the
+        // tanks pass through each other until they separate
+        this.time.delayedCall(1200, () => {
+          if (this.state === 'play' || this.state === 'clear') player.respawn();
+        });
       }
     }
 

@@ -94,12 +94,14 @@
   BC.POWERUP_SCORE = 500;
   BC.EXTRA_LIFE_SCORE = 20000;
 
-  BC.PLAYER_SPEED = 50;      // px/s
-  BC.BULLET_SPEED = 160;     // normal bullet px/s
-  BC.BULLET_SPEED_FAST = 240;
-  // Player tier stats (#6): 0 weak/slow shot, 1 standard, 2 fast bullets,
-  // 3 massive twin-gun steel-breaker
-  BC.PLAYER_BULLET_SPEED = [110, 170, 250, 250];
+  // Speeds are NES-exact (disassembly): px/frame x 60 on the same 208px field.
+  BC.PLAYER_SPEED = 45;      // 0.75 px/frame, all tiers (upgrades never change speed)
+  BC.BULLET_SPEED = 120;     // slow bullet: 2 px/frame
+  BC.BULLET_SPEED_FAST = 240; // fast bullet: 4 px/frame
+  // Star tiers per the original: 0 slow shot, 1+ fast shot, 2+ two bullets,
+  // 3 breaks steel. Tank 1990: the player spawns with one star.
+  BC.PLAYER_BULLET_SPEED = [120, 240, 240, 240];
+  BC.PLAYER_START_TIER = 1;
 
   // Spawn positions in subtile coords (top-left corner of the 2x2 tank cell)
   BC.SPAWNS = {
@@ -114,7 +116,7 @@
 
   // Build version, exchanged in the online handshake: both players must run
   // the same build so locally-constructed stages match the host's simulation.
-  BC.VERSION = '4.0';
+  BC.VERSION = '5.0';
 
   // Live per-run state (reset by GameScene on new game)
   BC.session = null;
@@ -129,7 +131,7 @@
   BC.newSession = function (stage, playerCount) {
     const n = playerCount === 2 ? 2 : 1;
     const players = [];
-    for (let i = 0; i < n; i++) players.push({ lives: 3, tier: 0 });
+    for (let i = 0; i < n; i++) players.push({ lives: 3, tier: BC.PLAYER_START_TIER });
     BC.session = {
       stage: stage,
       score: 0,
@@ -748,14 +750,16 @@
 // small canvas registered as the 'tiles' tileset.
 (function () {
   // ---------------------------------------------------------------- palettes
+  // NES-style two-tone bodies; 't' is near-black so the alternating track rows
+  // read as the classic notched treads with gaps
   const PAL = {
-    player: { A: '#d8a038', B: '#805010', C: '#f8e0a0', T: '#a87828', t: '#584008' },
-    player2: { A: '#48a048', B: '#145814', C: '#b8e8b0', T: '#389038', t: '#0c480c' },
-    enemy: { A: '#a8a8a8', B: '#505050', C: '#e8e8e8', T: '#909090', t: '#404040' },
-    red: { A: '#d04828', B: '#701008', C: '#f8a888', T: '#b03820', t: '#500800' },
-    h4: { A: '#48a848', B: '#106010', C: '#b0e8b0', T: '#389038', t: '#084808' },
-    h3: { A: '#c0a828', B: '#685808', C: '#f0e090', T: '#a89020', t: '#484000' },
-    h2: { A: '#c8c8c8', B: '#686868', C: '#f8f8f8', T: '#b0b0b0', t: '#585858' },
+    player: { A: '#d8a038', B: '#805010', C: '#f8e0a0', T: '#a87828', t: '#2c2008' },
+    player2: { A: '#48a048', B: '#145814', C: '#b8e8b0', T: '#389038', t: '#062806' },
+    enemy: { A: '#a8a8a8', B: '#505050', C: '#e8e8e8', T: '#909090', t: '#1c1c1c' },
+    red: { A: '#d04828', B: '#701008', C: '#f8a888', T: '#b03820', t: '#300400' },
+    h4: { A: '#48a848', B: '#106010', C: '#b0e8b0', T: '#389038', t: '#042c04' },
+    h3: { A: '#c0a828', B: '#685808', C: '#f0e090', T: '#a89020', t: '#2c2600' },
+    h2: { A: '#c8c8c8', B: '#686868', C: '#f8f8f8', T: '#b0b0b0', t: '#303030' },
   };
 
   // -------------------------------------------------------------- tank hulls
@@ -764,7 +768,26 @@
   // C highlight, . transparent. Each art is a full 16x16 sprite.
 
   // Player tiers are visually distinct: 0 small/weak, 1 standard,
-  // 2 long sniper barrel, 3 massive twin-gun hull.
+  // 2 long sniper barrel, 3 massive twin-gun hull. All carry the classic
+  // hollow turret-ring "eye" at the hull center.
+  const PLAYER_T1 = [
+    '.......CB.......',
+    '.......CB.......',
+    '.......CB.......',
+    '.TTT...CB...TTT.',
+    '.TTT..CCBB..TTT.',
+    '.TTT.CCAABB.TTT.',
+    '.TTT.CAAAAB.TTT.',
+    '.TTT.ACCCCB.TTT.',
+    '.TTT.AC..CB.TTT.',
+    '.TTT.AC..CB.TTT.',
+    '.TTT.ACCCCB.TTT.',
+    '.TTT.CAAAAB.TTT.',
+    '.TTT.CBBBBB.TTT.',
+    '.TTT..BBBB..TTT.',
+    '.TTT........TTT.',
+    '................',
+  ];
   const PLAYER_ARTS = [
     [ // tier 0 - weak: small hull, stubby barrel
       '................',
@@ -774,8 +797,8 @@
       '..TTT..CB..TTT..',
       '..TTT.CCBB.TTT..',
       '..TTTCCAABBTTT..',
-      '..TTTCAAAABTTT..',
-      '..TTTCAAAABTTT..',
+      '..TTTCC..BBTTT..',
+      '..TTTCC..BBTTT..',
       '..TTTCAAAABTTT..',
       '..TTTCCAABBTTT..',
       '..TTT.CBBB.TTT..',
@@ -784,58 +807,25 @@
       '................',
       '................',
     ],
-    [ // tier 1 - standard
-      '................',
-      '.......CB.......',
-      '.......CB.......',
-      '.......CB.......',
-      '.......CB.......',
-      'TTTT.CCCCBB.TTTT',
-      'TTTT.CAAAAB.TTTT',
-      'TTTT.CAAAAB.TTTT',
-      'TTTTCCAAAABBTTTT',
-      'TTTTCAAAAAABTTTT',
-      'TTTTCAAAAAABTTTT',
-      'TTTTCCAAAABBTTTT',
-      'TTTT.CAAAAB.TTTT',
-      'TTTT.CBBBBB.TTTT',
-      'TTTT..BBBB..TTTT',
-      '................',
-    ],
-    [ // tier 2 - fast bullets: long barrel with muzzle brake
-      '......CCBB......',
-      '......C..B......',
-      '.......CB.......',
-      '.......CB.......',
-      '.......CB.......',
-      'TTTT.CCCCBB.TTTT',
-      'TTTT.CAAAAB.TTTT',
-      'TTTT.CAAAAB.TTTT',
-      'TTTTCCAAAABBTTTT',
-      'TTTTCAAAAAABTTTT',
-      'TTTTCAAAAAABTTTT',
-      'TTTTCCAAAABBTTTT',
-      'TTTT.CAAAAB.TTTT',
-      'TTTT.CBBBBB.TTTT',
-      'TTTT..BBBB..TTTT',
-      '................',
-    ],
+    PLAYER_T1,
+    // tier 2 - fast bullets: long barrel with muzzle brake
+    ['......CCBB......', '......C..B......'].concat(PLAYER_T1.slice(2)),
     [ // tier 3 - massive: full-width hull, twin guns
       '....CB....CB....',
       '....CB....CB....',
       '....CB....CB....',
-      '....CB....CB....',
+      'TTTT.CB..CB.TTTT',
       'TTTTCCCCCCCCTTTT',
       'TTTTCAAAAAABTTTT',
-      'TTTTCACAACABTTTT',
       'TTTTCAAAAAABTTTT',
-      'TTTTCAACCAABTTTT',
-      'TTTTCAACCAABTTTT',
-      'TTTTCAAAAAABTTTT',
-      'TTTTCACAACABTTTT',
+      'TTTTCACCCCABTTTT',
+      'TTTTCAC..CABTTTT',
+      'TTTTCAC..CABTTTT',
+      'TTTTCACCCCABTTTT',
       'TTTTCAAAAAABTTTT',
       'TTTTCBBBBBBBTTTT',
       'TTTT.BBBBBB.TTTT',
+      'TTTT........TTTT',
       '................',
     ],
   ];
@@ -843,36 +833,36 @@
   const ENEMY_BASIC = [
     '................',
     '.......CB.......',
-    '.......CB.......',
+    '.TTT...CB...TTT.',
     '.TTT...CB...TTT.',
     '.TTT..CCBB..TTT.',
     '.TTT.CCAABB.TTT.',
-    '.TTTCCAAAABBTTT.',
-    '.TTTCAAAAAABTTT.',
-    '.TTTCAAAAAABTTT.',
-    '.TTTCAAAAAABTTT.',
-    '.TTTCCAAAABBTTT.',
+    '.TTT.ACCCCB.TTT.',
+    '.TTT.AC..CB.TTT.',
+    '.TTT.ACCCCB.TTT.',
     '.TTT.CAAAAB.TTT.',
-    '.TTT.CBBBBB.TTT.',
+    '.TTT.CAAAAB.TTT.',
+    '.TTTCBBBBBBBTTT.',
     '.TTT..BBBB..TTT.',
+    '.TTT........TTT.',
     '................',
     '................',
   ];
-  // fast: sleek arrow profile - pointed nose, slim body, thin tracks
+  // fast: slim body, full-height tracks, tapered nose
   const ENEMY_FAST = [
     '.......CB.......',
-    '......CCBB......',
-    '......CABB......',
-    '.....CCAABB.....',
-    '..T..CAAAAB..T..',
+    '..T...CCBB...T..',
+    '..TT..CABB..TT..',
+    '..TT.CCAABB.TT..',
     '..TT.CAAAAB.TT..',
-    '..TT.CAAAAB.TT..',
-    '..TT.CACCAB.TT..',
-    '..TT.CAAAAB.TT..',
+    '..TT.ACCCCB.TT..',
+    '..TT.AC..CB.TT..',
+    '..TT.ACCCCB.TT..',
     '..TT.CAAAAB.TT..',
     '..TT.CAAAAB.TT..',
     '..TT.CBBBBB.TT..',
-    '..TT..BBBB..TT..',
+    '..TT..CBBB..TT..',
+    '..TT...BB...TT..',
     '..T....BB....T..',
     '................',
     '................',
@@ -880,15 +870,15 @@
   const ENEMY_POWER = [
     '......CCBB......',
     '......CCBB......',
-    '.......CB.......',
+    'TTT....CB....TTT',
     'TTT....CB....TTT',
     'TTT...CCBB...TTT',
     'TTT..CAAAAB..TTT',
-    'TTT.CCAAAABB.TTT',
+    'TTT.CACCCCAB.TTT',
+    'TTT.CAC..CAB.TTT',
+    'TTT.CAC..CAB.TTT',
+    'TTT.CACCCCAB.TTT',
     'TTT.CAAAAAAB.TTT',
-    'TTT.CAAAAAAB.TTT',
-    'TTT.CAAAAAAB.TTT',
-    'TTT.CCAAAABB.TTT',
     'TTT..CAAAAB..TTT',
     'TTT..CBBBBB..TTT',
     'TTT...BBBB...TTT',
@@ -899,19 +889,19 @@
   const ENEMY_MASSIVE = [
     '....CB....CB....',
     '....CB....CB....',
-    '....CB....CB....',
+    'TTTT.CB..CB.TTTT',
     'TTTTCCCCCCCCTTTT',
-    'TTTTCAAAAAABTTTT',
-    'TTTTCACCCCABTTTT',
-    'TTTTCAAAAAABTTTT',
-    'TTTTCAACCAABTTTT',
     'TTTTCAACCAABTTTT',
     'TTTTCAAAAAABTTTT',
     'TTTTCACCCCABTTTT',
+    'TTTTCAC..CABTTTT',
+    'TTTTCAC..CABTTTT',
+    'TTTTCACCCCABTTTT',
     'TTTTCAAAAAABTTTT',
+    'TTTTCAACCAABTTTT',
     'TTTTCBBBBBBBTTTT',
     'TTTT.BBBBBB.TTTT',
-    'TTTT..BBBB..TTTT',
+    'TTTT........TTTT',
     '................',
   ];
 
@@ -2382,28 +2372,23 @@
       basic = 0;
     }
 
+    // NES spawn interval: 190 - 4*stage frames (stage clamped at 35);
+    // 2-player mode subtracts another 20 frames (applied in GameScene)
+    const spawnFrames = Math.max(50, 190 - 4 * Math.min(n, 35));
+
     return {
       roster: [basic, fast, power, armor],
-      maxConcurrent: n <= 50 ? 4 : n <= 80 ? 5 : 6,
-      enemySpeedMul: 1 + t * 0.35,
-      enemyBulletMul: 1 + t * 0.4,
-      spawnDelayMs: Math.max(1000, 3000 - n * 20),
-      // AI direction-decision weights: keep / random turn / toward player / toward base.
-      // Purposeful from stage 1 (see tools-run aitest thresholds), nastier later.
-      aiWeights: {
-        keep: 25,
-        random: Math.max(12, 38 - n * 0.26),
-        player: 15 + n * 0.2,
-        base: 14 + n * 0.44,
-      },
-      aiFireChance: 0.45 + t * 0.4,    // chance to fire when aligned with a target
-      // Armor modifier (#8): from stage 4 any tank type can spawn with extra
-      // hit layers; chance and max layers grow with the stage
+      maxConcurrent: 4,          // 4 in 1P; GameScene raises to 6 in 2P (NES-exact)
+      spawnDelayMs: Math.round(spawnFrames * 1000 / 60),
+      spawnFrames: spawnFrames,  // the AI phase clock derives from this (see enemy.js)
+      // Armor modifier (Tank 1990: any tank type may be armored): from stage 4,
+      // chance and max layers grow with the stage
       armorChance: n < 4 ? 0 : Math.min(0.4, 0.08 + (n - 4) * 0.004),
       armorMaxLayers: 1 + (n >= 25 ? 1 : 0) + (n >= 60 ? 1 : 0),
-      freezeMs: Math.max(5000, 10000 - n * 50),
-      shovelMs: Math.max(8000, 15000 - n * 70),
-      helmetMs: 10000,
+      // Fixed NES timer durations (10/20 ticks of 64 frames)
+      freezeMs: 10600,
+      shovelMs: 21300,
+      helmetMs: 10600,
       // Terrain densities for the generator (fraction of feature placements)
       gen: {
         features: 14 + Math.floor(t * 8),   // total feature primitives to place
@@ -2935,8 +2920,23 @@
     }
 
     // Drive toward wantDir (-1 = no input). Returns px actually moved.
+    // Ice (players only, NES behavior): stepping onto ice while moving arms a
+    // 28px skid; its first 13px are FORCED (input ignored), after which a held
+    // direction regains control; releasing input slides out the remainder.
     drive(wantDir, dt, tanks) {
       let moved = 0;
+      const onIce = this.isPlayer && this.terrain.isIceAtPx(this.x, this.y);
+      if (!onIce) this.skid = 0;
+
+      if (this.isPlayer && this.skid > 15) {
+        // forced skid phase: keep sliding in the current facing
+        moved = this._axisMove(this.dir, this.speed * dt, tanks);
+        this.skid = moved > 0 ? Math.max(15, this.skid - moved) : 15;
+        this._animate(moved);
+        this.syncSprite();
+        return moved;
+      }
+
       if (wantDir >= 0) {
         if (wantDir !== this.dir) {
           const perpendicular = (wantDir % 2) !== (this.dir % 2);
@@ -2961,24 +2961,26 @@
           this.dir = wantDir;
         }
         moved = this._axisMove(this.dir, this.speed * dt, tanks);
-        // entering ice arms a skid
-        this.skid = this.terrain.isIceAtPx(this.x, this.y) ? 12 : 0;
-      } else if (this.skid > 0) {
+        // moving onto ice with an empty counter arms a fresh 28px skid
+        if (onIce && moved > 0 && this.skid === 0) this.skid = 28;
+      } else if (this.isPlayer && this.skid > 0) {
         const step = Math.min(this.skid, this.speed * dt);
         moved = this._axisMove(this.dir, step, tanks);
         this.skid = moved > 0 ? this.skid - moved : 0;
-        if (!this.terrain.isIceAtPx(this.x, this.y)) this.skid = 0;
       }
-      if (moved > 0) {
-        this.animDist += moved;
-        if (this.animDist >= 4) {
-          this.animDist = 0;
-          this.animFrame ^= 1;
-          this.sprite.setFrame(this.frameBase + '_' + this.animFrame);
-        }
-      }
+      this._animate(moved);
       this.syncSprite();
       return moved;
+    }
+
+    _animate(moved) {
+      if (moved <= 0) return;
+      this.animDist += moved;
+      if (this.animDist >= 4) {
+        this.animDist = 0;
+        this.animFrame ^= 1;
+        this.sprite.setFrame(this.frameBase + '_' + this.animFrame);
+      }
     }
 
     // Muzzle position for spawning bullets
@@ -3031,33 +3033,32 @@
       this.sprite.setVisible(true);
       this.sprite.setAlpha(1);
       this.applyTier();
-      this.shieldUntil = this.scene.playTime + 3000;
+      this.shieldUntil = this.scene.playTime + 3200; // 3 ticks of 64 frames
       this.syncSprite();
       if (!first) this.scene.events.emit('hud');
     }
 
-    bulletLimit() { return this.tier >= 3 ? 2 : 1; }
+    bulletLimit() { return this.tier >= 2 ? 2 : 1; }
     bulletSpeed() { return BC.PLAYER_BULLET_SPEED[this.tier]; }
 
     update(dt, tanks) {
       if (!this.alive) return;
       const t = this.scene.playTime;
-      const stunned = t < this.stunnedUntil;
-      const frozen = t < (this.scene.playersFrozenUntil || 0); // enemy clock
+      // friendly-fire stun and the enemy-taken clock behave identically per
+      // the sources: the tank cannot move or turn, but can still shoot
+      const immobile = t < this.stunnedUntil || t < (this.scene.playersFrozenUntil || 0);
       const intent = BC.intents[this.pIndex] || BC.intents[0];
 
-      // stunned tanks blink and hold position but keep their trigger (original
-      // 2P behavior); frozen tanks can't do anything
-      this.sprite.setAlpha((stunned || frozen) && Math.floor(t / 120) % 2 === 0 ? 0.4 : 1);
+      this.sprite.setAlpha(immobile && Math.floor(t / 120) % 2 === 0 ? 0.4 : 1);
 
-      if (!stunned && !frozen) {
+      if (!immobile) {
         this.drive(intent.dir, dt, tanks);
       } else {
         this.syncSprite();
       }
 
       this.fireCooldown -= dt * 1000;
-      if (!frozen && intent.fire && this.fireCooldown <= 0 &&
+      if (intent.fire && this.fireCooldown <= 0 &&
           this.scene.bullets.countFor(this) < this.bulletLimit()) {
         const m = this.muzzle();
         this.scene.bullets.fire(this, m.x, m.y, this.dir, this.bulletSpeed(), {
@@ -3065,7 +3066,7 @@
           owner: this,
           canBreakSteel: this.tier >= 3,
         });
-        this.fireCooldown = 180;
+        this.fireCooldown = 120; // Tank 1990 rapid-fire cadence on held button
         BC.sfx.play('fire');
       }
 
@@ -3094,7 +3095,7 @@
       this.alive = false;
       this.sprite.setVisible(false);
       this.shieldSprite.setVisible(false);
-      this.state.tier = 0;
+      this.state.tier = BC.PLAYER_START_TIER; // Tank 1990: respawn with one star
       BC.sfx.play('playerBoom');
       this.scene.fx.bigBoom(this.x, this.y);
       this.scene.onPlayerDeath(this);
@@ -3104,178 +3105,144 @@
 })();
 
 // ==== src/game/enemy.js ====
-// Enemy tanks: 4 tiers (basic / fast / power / massive) plus stackable
-// modifiers - armor layers (extra HP, any tier, stage-gated) and flashing
-// (bonus: absorbs the first hit and drops an item). Lane-based AI decides
-// direction on blockage, tile-boundary crossings and a fallback timer,
-// weighted between random / toward-player / toward-base per stage.
+// Enemy tanks with the ORIGINAL AI, transcribed from the NES disassembly:
+// - decisions only at 8px grid alignments: 1/16 chance to re-target
+// - blocked: 75% grind against the wall (brief pause, same direction),
+//   25% reverse - and if aligned, 50% rotate 90 degrees / 50% re-target
+// - re-target phases by stage clock (in 64-frame ticks vs the spawn interval):
+//   early = random roaming, mid = chase a player (by tank index parity),
+//   late = converge on the HQ
+// - firing: 1/32 chance per frame in the current facing, never aimed
+// Tiers: basic / fast / power / massive. Modifiers: armor layers (extra HP,
+// palette flickers by remaining HP like the original armor tank) and flashing
+// (bonus: absorbs the first hit and drops an item).
 (function () {
   const TYPES = [
-    { speed: 40, hp: 1, bulletFast: false, bullets: 1 }, // basic
-    { speed: 72, hp: 1, bulletFast: false, bullets: 1 }, // fast
-    { speed: 52, hp: 1, bulletFast: true, bullets: 1 },  // power (fast bullets)
-    { speed: 34, hp: 4, bulletFast: false, bullets: 2 }, // massive (twin shot)
+    { speed: 30, hp: 1, bulletFast: false, bullets: 1 }, // basic  (0.5 px/frame)
+    { speed: 60, hp: 1, bulletFast: false, bullets: 1 }, // fast   (1.0 px/frame)
+    { speed: 30, hp: 1, bulletFast: true, bullets: 1 },  // power  (0.5, fast shot)
+    { speed: 30, hp: 4, bulletFast: false, bullets: 2 }, // massive (0.5, twin gun)
   ];
+  // palette pairs flickered per frame by remaining HP (original armor tank)
+  function palettePair(hp) {
+    if (hp >= 4) return ['h4', 'n'];
+    if (hp === 3) return ['h3', 'n'];
+    if (hp === 2) return ['h3', 'h4'];
+    return ['n', 'n'];
+  }
 
   BC.Enemy = class extends BC.Tank {
-    constructor(scene, terrain, fx, fy, type, flashing, cfg, armorLayers) {
+    constructor(scene, terrain, fx, fy, type, flashing, cfg, armorLayers, index) {
       super(scene, terrain, fx, fy, {
         frameBase: 'tank_e' + type + '_n',
-        speed: TYPES[type].speed * cfg.enemySpeedMul,
+        speed: TYPES[type].speed,
         isPlayer: false,
       });
       this.type = type;
       this.hp = TYPES[type].hp + (armorLayers || 0);
       this.flashing = flashing;
       this.cfg = cfg;
-      this.shieldUntil = 0; // enemy-collected helmet
+      this.index = index || 0;
+      this.shieldUntil = 0;
+      this.pierce = false;
       this.aiDir = BC.DIR.DOWN;
-      this.decisionTimer = 0;
-      this.fireTimer = 500 + Math.random() * 1000;
-      this.distSinceDecision = 0;
-      this.flashTimer = 0;
-      this._applyType();
-      this._updatePalette();
-    }
-
-    _applyType() {
-      const t = TYPES[this.type];
-      this.speed = t.speed * this.cfg.enemySpeedMul;
-      this.bulletSpeed = (t.bulletFast ? BC.BULLET_SPEED_FAST : BC.BULLET_SPEED) * this.cfg.enemyBulletMul;
-      this.bulletLimit = t.bullets;
-    }
-
-    // enemy-collected star: promote one tier, keep damage taken
-    promote() {
-      if (this.type >= 3) return;
-      const dmg = TYPES[this.type].hp + 0 - this.hp; // usually 0
-      this.type += 1;
-      this.hp = Math.max(1, TYPES[this.type].hp - dmg);
-      this._applyType();
-      this._updatePalette();
-    }
-
-    _palette() {
-      if (this.hp >= 4) return 'h4';
-      if (this.hp === 3) return 'h3';
-      if (this.hp === 2) return 'h2';
-      return 'n';
-    }
-
-    _updatePalette(red) {
-      this.setFrameBase('tank_e' + this.type + '_' + (red ? 'r' : this._palette()));
+      this.moveAcc = 0;       // px since last grid-alignment decision point
+      this.pauseUntil = 0;    // wall-grind pause (ms of playTime)
+      this.bulletSpeed = TYPES[type].bulletFast ? BC.BULLET_SPEED_FAST : BC.BULLET_SPEED;
+      this.bulletLimit = TYPES[type].bullets;
     }
 
     isShielded() {
       return this.scene.playTime < this.shieldUntil;
     }
 
-    decide(target) {
-      const w = this.cfg.aiWeights;
-      // proximity commitment: once near the base, press the attack instead of
-      // wandering off (keeps distant tanks from beelining, but base pressure real)
-      const bdist = Math.abs(this.x - (BC.EAGLE.sx * 8 + 8)) + Math.abs(this.y - (BC.EAGLE.sy * 8 + 8));
-      const baseW = bdist < 72 ? w.base * 3 : w.base;
-      const total = w.keep + w.random + w.player + baseW;
-      let roll = Math.random() * total;
-      if (roll < w.keep) {
-        this.decisionTimer = 800 + Math.random() * 800;
-        return;
-      }
-      roll -= w.keep;
-      if (roll < w.random) {
-        this.aiDir = Math.floor(Math.random() * 4);
-      } else {
-        roll -= w.random;
-        const towardPlayer = roll < w.player && target && bdist >= 72;
-        const tx = towardPlayer ? target.x : BC.EAGLE.sx * 8 + 8;
-        const ty = towardPlayer ? target.y : BC.EAGLE.sy * 8 + 8;
-        const dx = tx - this.x, dy = ty - this.y;
-        this.aiDir = Math.abs(dx) > Math.abs(dy)
-          ? (dx > 0 ? BC.DIR.RIGHT : BC.DIR.LEFT)
-          : (dy > 0 ? BC.DIR.DOWN : BC.DIR.UP);
-      }
-      this.decisionTimer = 800 + Math.random() * 800;
+    _aligned() {
+      return Math.abs(this.x - Math.round(this.x / 8) * 8) < 0.5 &&
+        Math.abs(this.y - Math.round(this.y / 8) * 8) < 0.5;
     }
 
-    // nearest living player, or null
-    _target(players) {
-      let best = null, bestD = Infinity;
-      for (const p of players) {
-        if (!p || !p.alive) continue;
-        const d = Math.abs(p.x - this.x) + Math.abs(p.y - this.y);
-        if (d < bestD) { bestD = d; best = p; }
+    // sub_DE72: phase by stage clock (64-frame ticks) vs the spawn interval
+    retarget(players) {
+      const ticks = this.scene.playTime / 1066.7;
+      const interval = this.cfg.spawnFrames;
+      let tx = null, ty = null;
+      if (ticks <= interval / 8) {
+        this.aiDir = Math.floor(Math.random() * 4); // roam
+        return;
       }
-      return best;
+      if (ticks <= interval / 4) {
+        // chase a player: even tank index prefers P1, odd prefers P2
+        const pref = this.index % 2;
+        const pick = (players[pref] && players[pref].alive) ? players[pref]
+          : (players[1 - pref] && players[1 - pref].alive) ? players[1 - pref] : null;
+        if (pick) { tx = pick.x; ty = pick.y; }
+      }
+      if (tx === null) { // late phase (or no live player): head for the HQ
+        tx = BC.EAGLE.sx * 8 + 8;
+        ty = BC.EAGLE.sy * 8 + 8;
+      }
+      const dx = tx - this.x, dy = ty - this.y;
+      const preferVertical = Math.random() < 0.5;
+      const vDir = dy < 0 ? BC.DIR.UP : BC.DIR.DOWN;
+      const hDir = dx < 0 ? BC.DIR.LEFT : BC.DIR.RIGHT;
+      if (preferVertical) this.aiDir = Math.abs(dy) > 0.5 ? vDir : (Math.abs(dx) > 0.5 ? hDir : Math.floor(Math.random() * 4));
+      else this.aiDir = Math.abs(dx) > 0.5 ? hDir : (Math.abs(dy) > 0.5 ? vDir : Math.floor(Math.random() * 4));
     }
 
     update(dt, tanks, players, frozen) {
       if (!this.alive) return;
+      const framesNow = Math.floor(this.scene.playTime / 16.7);
 
-      // bonus-tank red flash / helmet-shield pulse
-      this.flashTimer += dt * 1000;
+      // visuals: bonus flash (red, ~8-frame cadence) or HP palette flicker
       if (this.flashing) {
-        this._updatePalette(Math.floor(this.flashTimer / 150) % 2 === 0);
+        this.setFrameBase('tank_e' + this.type + '_' + (Math.floor(framesNow / 8) % 2 === 0 ? 'r' : 'n'));
+      } else {
+        this.setFrameBase('tank_e' + this.type + '_' + palettePair(this.hp)[framesNow % 2]);
       }
-      this.sprite.setAlpha(this.isShielded() && Math.floor(this.flashTimer / 120) % 2 === 0 ? 0.55 : 1);
+      this.sprite.setAlpha(this.isShielded() && framesNow % 8 < 4 ? 0.55 : 1);
 
       if (frozen) {
         this.syncSprite();
         return;
       }
 
-      const target = this._target(players);
-      this.decisionTimer -= dt * 1000;
-      const want = this.speed * dt;
-      const moved = this.drive(this.aiDir, dt, tanks);
-      this.distSinceDecision += moved;
-
-      if (moved < want * 0.4) {
-        this.decide(target);
-        if (moved === 0 && Math.random() < 0.3) {
-          this.aiDir = Math.floor(Math.random() * 4);
-        }
-      } else if (this.distSinceDecision >= 16) {
-        this.distSinceDecision = 0;
-        if (Math.random() < 0.35) this.decide(target);
-      } else if (this.decisionTimer <= 0) {
-        this.decide(target);
-      }
-
-      // firing
-      this.fireTimer -= dt * 1000;
-      if (this.fireTimer <= 0) {
-        this.fireTimer = 600 + Math.random() * 900;
-        if (this.scene.bullets.countFor(this) < this.bulletLimit) {
-          let shoot = Math.random() < 0.25; // random potshot
-          if (!shoot && target) {
-            // roughly aligned with a player and facing them
-            const dx = target.x - this.x, dy = target.y - this.y;
-            if (Math.abs(dx) < 10 && ((dy > 0 && this.aiDir === BC.DIR.DOWN) || (dy < 0 && this.aiDir === BC.DIR.UP))) shoot = Math.random() < this.cfg.aiFireChance;
-            if (Math.abs(dy) < 10 && ((dx > 0 && this.aiDir === BC.DIR.RIGHT) || (dx < 0 && this.aiDir === BC.DIR.LEFT))) shoot = Math.random() < this.cfg.aiFireChance;
-          }
-          if (!shoot) {
-            // facing the base and roughly aligned with it on either axis -
-            // covers shelling the wall from the sides, not just from above
-            const bdx = BC.EAGLE.sx * 8 + 8 - this.x;
-            const bdy = BC.EAGLE.sy * 8 + 8 - this.y;
-            const facingBase =
-              (this.aiDir === BC.DIR.RIGHT && bdx > 6) ||
-              (this.aiDir === BC.DIR.LEFT && bdx < -6) ||
-              (this.aiDir === BC.DIR.DOWN && bdy > 6) ||
-              (this.aiDir === BC.DIR.UP && bdy < -6);
-            if (facingBase && (Math.abs(bdx) < 12 || Math.abs(bdy) < 12)) {
-              shoot = Math.random() < this.cfg.aiFireChance;
+      // ---- movement + direction decisions
+      if (this.scene.playTime < this.pauseUntil) {
+        this.syncSprite();
+      } else {
+        const want = this.speed * dt;
+        const moved = this.drive(this.aiDir, dt, tanks);
+        this.moveAcc += moved;
+        if (moved < want * 0.5) {
+          // blocked: keep the decision cadence anchored to the grid
+          this.moveAcc = 0;
+          if (Math.random() < 0.75) {
+            this.pauseUntil = this.scene.playTime + 33; // grind: 2-frame pause, keep dir
+          } else {
+            this.aiDir = BC.OPPOSITE[this.aiDir];
+            if (this._aligned()) {
+              if (Math.random() < 0.5) {
+                this.aiDir = (this.aiDir + (Math.random() < 0.5 ? 1 : 3)) % 4; // 90-degree turn
+              } else {
+                this.retarget(players);
+              }
             }
           }
-          if (shoot) {
-            const m = this.muzzle();
-            this.scene.bullets.fire(this, m.x, m.y, this.dir, this.bulletSpeed, {
-              fromPlayer: false,
-              canBreakSteel: false,
-            });
-          }
+        } else if (this.moveAcc >= 8) {
+          // one grid alignment crossed: 1/16 chance to re-target
+          this.moveAcc -= 8;
+          if (Math.random() < 1 / 16) this.retarget(players);
         }
+      }
+
+      // ---- firing: 1/32 per frame, current facing, one volley per free slot
+      if (Math.random() < (dt * 60) / 32 &&
+          this.scene.bullets.countFor(this) < this.bulletLimit) {
+        const m = this.muzzle();
+        this.scene.bullets.fire(this, m.x, m.y, this.dir, this.bulletSpeed, {
+          fromPlayer: false,
+          canBreakSteel: !!this.pierce, // enemy-collected star (Tank 1990)
+        });
       }
     }
 
@@ -3287,17 +3254,13 @@
         return false;
       }
       if (this.flashing) {
-        // the flash is an extra layer: first hit only pops it and drops the item
+        // NES rule: the item-revealing hit also counts as a normal hit
         this.flashing = false;
         this.sprite.setAlpha(1);
-        this._updatePalette();
         this.scene.powerups.spawn();
-        BC.sfx.play('steel');
-        return false;
       }
       this.hp -= 1;
       if (this.hp > 0) {
-        this._updatePalette();
         BC.sfx.play('steel');
         return false;
       }
@@ -3313,7 +3276,7 @@
       return true;
     }
 
-    // grenade power-up: no score, no drops
+    // grenade power-up: no score, no drops (as in the original)
     obliterate() {
       if (!this.alive) return;
       this.alive = false;
@@ -3338,8 +3301,8 @@
       this.terrain = terrain;
       this.cfg = cfg;
       this.enemies = [];
-      this.pointIdx = 0;
-      this.timer = 1000; // first spawn arrives quickly
+      this.pointIdx = 1; // NES order: center, right, left, ...
+      this.timer = 0;    // first spawn attempt is immediate (NES-exact)
       this.spawnedCount = 0;
       this.pendingFlickers = 0;
       this.flashingSet = scene.testMode ? FLASHING_TEST : FLASHING;
@@ -3380,8 +3343,8 @@
       this.timer -= dt * 1000;
       if (this.timer > 0) return;
       if (this.spawnedCount >= this.queue.length) return;
-      if (this.activeCount() >= this.cfg.maxConcurrent) {
-        this.timer = 300;
+      if (this.activeCount() + this.pendingFlickers >= this.cfg.maxConcurrent) {
+        this.timer = 100; // NES retries every frame once a slot frees
         return;
       }
       // pick next clear spawn point (try all three before giving up this tick)
@@ -3411,7 +3374,7 @@
       } else if (Math.random() < this.cfg.armorChance) {
         armor = 1 + Math.floor(Math.random() * this.cfg.armorMaxLayers);
       }
-      this._flickerThenSpawn(chosen.cx, chosen.cy, this.queue[idx], this.flashingSet.indexOf(idx) !== -1, armor);
+      this._flickerThenSpawn(chosen.cx, chosen.cy, this.queue[idx], this.flashingSet.indexOf(idx) !== -1, armor, idx);
       this.scene.events.emit('hud');
     }
 
@@ -3423,7 +3386,7 @@
       return true;
     }
 
-    _flickerThenSpawn(cx, cy, type, flashing, armorLayers) {
+    _flickerThenSpawn(cx, cy, type, flashing, armorLayers, index) {
       const scene = this.scene;
       this.pendingFlickers += 1;
       const star = scene.add.sprite(scene.fieldOx + cx, scene.fieldOy + cy, 'atlas', 'spawn0')
@@ -3447,7 +3410,7 @@
         }
         star.destroy();
         this.pendingFlickers -= 1;
-        const e = new BC.Enemy(scene, this.terrain, cx, cy, type, flashing, this.cfg, armorLayers);
+        const e = new BC.Enemy(scene, this.terrain, cx, cy, type, flashing, this.cfg, armorLayers, index);
         // flashing bonus tank replaces any uncollected power-up
         if (flashing) scene.powerups.removeExisting();
         this.enemies.push(e);
@@ -3597,13 +3560,14 @@
             return true;
           }
         }
-        // friendly fire (original 2P rule): the hit teammate is stunned -
-        // unable to move for a while, but can still shoot
+        // friendly fire (original rule, per the NES disassembly): ~4.4s stun
+        // that blocks movement but not firing; hitting an already-stunned
+        // player does NOT reload the timer; a shielded player ignores it
         for (const p of scene.players) {
           if (!p || !p.alive || p === b.owner) continue;
           if (overlapsTank(b, p)) {
             scene.bullets.kill(b, true);
-            if (!p.isShielded()) p.stun(2500);
+            if (!p.isShielded() && scene.playTime >= p.stunnedUntil) p.stun(4400);
             return true;
           }
         }
@@ -3647,10 +3611,12 @@
 // ==== src/game/powerup.js ====
 // Power-ups: one on the field at a time, blinking, collected by driving over.
 // Both sides can grab them (Tank 1990 rule). Player effects help the
-// collector; enemy-collected items turn against the players:
-//   helmet -> all enemies shielded    clock  -> players frozen
-//   shovel -> base wall removed       star   -> collector promotes a tier
-//   grenade-> player tanks explode    tank   -> all enemies become armored bonus tanks
+// collector; enemy-collected effects follow the documented Tank 1990 table:
+//   helmet/tank -> unarmored enemies become armored. armored become bonus
+//   clock  -> players frozen 10s but can still shoot
+//   shovel -> base wall removed for a while
+//   star   -> every enemy on the field gains steel-piercing shots
+//   grenade-> player tanks explode
 (function () {
   BC.Powerups = class {
     constructor(scene, terrain) {
@@ -3670,17 +3636,19 @@
     spawn(forcedType) {
       this.removeExisting();
       const type = forcedType !== undefined ? forcedType : Math.floor(Math.random() * 6);
-      // random tile whose 2x2 subtiles are tank-reachable-ish (not water/steel/eagle)
+      // NES drop grid: 16 fixed spots (X and Y each from 48/96/144/192,
+      // top-left), re-rolled while the spot is unreachable
+      const SPOTS = [56, 104, 152, 200];
       let fx = 104, fy = 104;
       for (let tries = 0; tries < 24; tries++) {
-        const tx = 1 + Math.floor(Math.random() * 11);
-        const ty = 1 + Math.floor(Math.random() * 10);
+        const cx = SPOTS[Math.floor(Math.random() * 4)];
+        const cy = SPOTS[Math.floor(Math.random() * 4)];
         let ok = true;
-        for (const [dx, dy] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
-          const v = this.terrain.get(tx * 2 + dx, ty * 2 + dy);
+        for (const [dx, dy] of [[-1, -1], [0, -1], [-1, 0], [0, 0]]) {
+          const v = this.terrain.get(cx / 8 + dx, cy / 8 + dy);
           if (v === BC.T.WATER || v === BC.T.STEEL || v === BC.T.EAGLE) { ok = false; break; }
         }
-        if (ok) { fx = tx * 16 + 8; fy = ty * 16 + 8; break; }
+        if (ok) { fx = cx; fy = cy; break; }
       }
       const sprite = this.scene.add.sprite(this.scene.fieldOx + fx, this.scene.fieldOy + fy, 'atlas', 'pw' + type)
         .setDepth(BC.DEPTH.POWERUP);
@@ -3741,31 +3709,31 @@
     applyEnemy(type, enemy) {
       const scene = this.scene;
       const P = BC.POWERUP;
-      if (type === P.HELMET) {
+      if (type === P.HELMET || type === P.TANK) {
+        // documented Tank 1990 swap: unarmored enemies become 4-hit armored,
+        // armored ones become flashing bonus tanks (visuals re-derive each frame)
         for (const e of scene.spawner.enemies) {
-          if (e.alive) e.shieldUntil = scene.playTime + 8000;
+          if (!e.alive) continue;
+          if (e.hp > 1) e.flashing = true;
+          else e.hp = 4;
         }
       } else if (type === P.CLOCK) {
-        scene.playersFrozenUntil = scene.playTime + 5000;
+        // players freeze in place but can still shoot (see player.js)
+        scene.playersFrozenUntil = scene.playTime + scene.cfg.freezeMs;
       } else if (type === P.SHOVEL) {
         // the base wall crumbles away for a while
         scene.shovelUntil = 0;
         for (const [sx, sy] of this.terrain.shellCells) this.terrain.set(sx, sy, BC.T.EMPTY);
         scene.shellGoneUntil = scene.playTime + 12000;
       } else if (type === P.STAR) {
-        enemy.promote();
+        // every enemy on the field can now pierce steel - dangerous to leave
+        for (const e of scene.spawner.enemies) {
+          if (e.alive) e.pierce = true;
+        }
       } else if (type === P.GRENADE) {
         BC.sfx.play('bigboom');
         for (const p of scene.players) {
           if (p && p.alive) p.hit(); // spawn/helmet shields still protect
-        }
-      } else if (type === P.TANK) {
-        // every enemy on the field becomes an armored flashing bonus tank
-        for (const e of scene.spawner.enemies) {
-          if (!e.alive) continue;
-          e.flashing = true;
-          e.hp += 1;
-          e._updatePalette();
         }
       }
       scene.events.emit('hud');
@@ -4535,11 +4503,11 @@
   const PAGES = [
     {
       title: 'PLAYER TANKS',
+      subtitle: 'YOU START WITH ONE STAR',
       rows: [
-        { cycle: ['tank_p0_0', 'tank_p0_1'], name: 'TIER 0', desc: 'WEAK. VERY SLOW SHOT' },
-        { cycle: ['tank_p1_0', 'tank_p1_1'], name: 'TIER 1', desc: 'STANDARD TANK' },
-        { cycle: ['tank_p2_0', 'tank_p2_1'], name: 'TIER 2', desc: 'FAST BULLETS' },
-        { cycle: ['tank_p3_0', 'tank_p3_1'], name: 'TIER 3', desc: 'TWIN GUN BREAKS STEEL' },
+        { cycle: ['tank_p1_0', 'tank_p1_1'], name: '1 STAR', desc: 'FAST SHOT. START TIER' },
+        { cycle: ['tank_p2_0', 'tank_p2_1'], name: '2 STARS', desc: 'TWO BULLETS AT ONCE' },
+        { cycle: ['tank_p3_0', 'tank_p3_1'], name: '3 STARS', desc: 'BREAKS STEEL WALLS' },
         { cycle: ['tank_q1_0', 'tank_q1_1'], name: 'PLAYER 2', desc: 'GREEN TANK IN 2P MODE' },
       ],
     },
@@ -4714,6 +4682,15 @@
       this.fieldOx = L.fieldOx;
       this.fieldOy = L.fieldOy;
       this.cfg = BC.difficulty(this.stageN);
+      if (BC.session.players.length === 2) {
+        // NES-exact 2P adjustments: 6 concurrent enemies, spawn 20 frames
+        // sooner - and the AI phase clock derives from the same interval
+        this.cfg = Object.assign({}, this.cfg, {
+          maxConcurrent: 6,
+          spawnFrames: this.cfg.spawnFrames - 20,
+          spawnDelayMs: Math.max(100, Math.round((this.cfg.spawnFrames - 20) * 1000 / 60)),
+        });
+      }
       if (this.testMode) {
         // test range: unhurried enemies so surfaces and items can be tried
         this.cfg = Object.assign({}, this.cfg, { spawnDelayMs: 7000, maxConcurrent: 2 });
@@ -5099,6 +5076,8 @@
     pixelArt: true,
     roundPixels: true,
     banner: false,
+    // the NES-transcribed cadences assume 60Hz; cap high-refresh displays
+    fps: { limit: 60 },
     scale: {
       mode: Phaser.Scale.FIT,
       autoCenter: Phaser.Scale.CENTER_BOTH,

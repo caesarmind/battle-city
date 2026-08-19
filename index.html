@@ -121,7 +121,7 @@
 
   // Build version, exchanged in the online handshake: both players must run
   // the same build so locally-constructed stages match the host's simulation.
-  BC.VERSION = '5.6';
+  BC.VERSION = '5.7';
 
   // Live per-run state (reset by GameScene on new game)
   BC.session = null;
@@ -1499,14 +1499,19 @@
 })();
 
 // ==== src/core/sfx.js ====
-// WebAudio sound effects, synthesized at play time. No audio files.
+// WebAudio sound effects, synthesized to the NES original's own parameters
+// (waveform, duty, frequency sweep, envelope and duration read from the ROM's
+// sound engine). No audio files: everything is generated at play time.
 // The AudioContext is created lazily and resumed on the first user gesture
 // (iOS/Android autoplay policy); every call no-ops safely until then.
 (function () {
   let ctx = null;
   let master = null;
   let muted = !BC.storage.getSound();
-  let noiseBuf = null;
+  const waves = {};   // duty -> PeriodicWave
+  const noises = {};  // lfsr clock -> AudioBuffer
+
+  const FRAME = 1 / 60.0988; // NES frame, 16.639 ms
 
   function ensure() {
     if (!ctx) {
@@ -1516,10 +1521,6 @@
       master = ctx.createGain();
       master.gain.value = muted ? 0 : 0.5;
       master.connect(ctx.destination);
-      // 1s of white noise, reused by all noise-based effects
-      noiseBuf = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate);
-      const d = noiseBuf.getChannelData(0);
-      for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
     }
     return ctx;
   }
@@ -1528,78 +1529,201 @@
     if (ensure() && ctx.state === 'suspended') ctx.resume();
   }
 
-  function env(gainNode, t0, peak, decay) {
-    gainNode.gain.setValueAtTime(0.0001, t0);
-    gainNode.gain.exponentialRampToValueAtTime(peak, t0 + 0.005);
-    gainNode.gain.exponentialRampToValueAtTime(0.0001, t0 + decay);
+  function ready() {
+    return !!ctx && ctx.state === 'running' && !muted;
   }
 
-  function tone(type, f0, f1, dur, peak, delay) {
-    if (!ensure() || ctx.state !== 'running') return;
-    const t0 = ctx.currentTime + (delay || 0);
+  // NES pulse channel: duty 0.125 / 0.25 / 0.5 (0.75 is spectrally the same as 0.25)
+  function pulseWave(duty) {
+    const key = String(duty);
+    if (!waves[key]) {
+      const n = 40;
+      const real = new Float32Array(n + 1);
+      const imag = new Float32Array(n + 1);
+      for (let i = 1; i <= n; i++) imag[i] = (2 / (i * Math.PI)) * Math.sin(i * Math.PI * duty);
+      waves[key] = ctx.createPeriodicWave(real, imag);
+    }
+    return waves[key];
+  }
+
+  // NES noise channel: a value held for one LFSR clock period
+  function noiseBuffer(clockHz) {
+    const key = String(clockHz);
+    if (!noises[key]) {
+      const seconds = 1;
+      const len = Math.ceil(ctx.sampleRate * seconds);
+      const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+      const d = buf.getChannelData(0);
+      const hold = Math.max(1, Math.round(ctx.sampleRate / clockHz));
+      let v = 0;
+      for (let i = 0; i < len; i++) {
+        if (i % hold === 0) v = Math.random() * 2 - 1;
+        d[i] = v;
+      }
+      noises[key] = buf;
+    }
+    return noises[key];
+  }
+
+  // one pulse/triangle voice: freqs stepped every `step` seconds.
+  // env: 'pluck' retriggers a decay per note, 'flat' holds, number = tremolo Hz
+  function voice(opts) {
+    const t0 = ctx.currentTime + (opts.delay || 0);
     const osc = ctx.createOscillator();
     const g = ctx.createGain();
-    osc.type = type;
-    osc.frequency.setValueAtTime(f0, t0);
-    if (f1 !== f0) osc.frequency.exponentialRampToValueAtTime(Math.max(1, f1), t0 + dur);
-    env(g, t0, peak, dur);
+    if (opts.type === 'triangle') osc.type = 'triangle';
+    else osc.setPeriodicWave(pulseWave(opts.duty === undefined ? 0.5 : opts.duty));
+    const step = opts.step;
+    const freqs = opts.freqs;
+    for (let i = 0; i < freqs.length; i++) {
+      osc.frequency.setValueAtTime(freqs[i], t0 + i * step);
+    }
+    const total = opts.total !== undefined ? opts.total : freqs.length * step;
+    const vol = opts.gain;
+    if (opts.env === 'pluck') {
+      const decay = opts.decay || step;
+      for (let i = 0; i < freqs.length; i++) {
+        const t = t0 + i * step;
+        g.gain.setValueAtTime(vol, t);
+        g.gain.linearRampToValueAtTime(0.0001, t + Math.min(decay, step * 0.98));
+      }
+    } else if (typeof opts.env === 'number') {
+      // looping envelope = tremolo at env Hz (sawtooth down)
+      const period = 1 / opts.env;
+      for (let t = 0; t < total; t += period) {
+        g.gain.setValueAtTime(vol, t0 + t);
+        g.gain.linearRampToValueAtTime(vol * 0.15, t0 + Math.min(t + period, total));
+      }
+    } else {
+      g.gain.setValueAtTime(vol, t0);
+      g.gain.setValueAtTime(vol, t0 + total * 0.92);
+      g.gain.linearRampToValueAtTime(0.0001, t0 + total);
+    }
     osc.connect(g);
     g.connect(master);
     osc.start(t0);
-    osc.stop(t0 + dur + 0.02);
+    osc.stop(t0 + total + 0.02);
   }
 
-  function noise(dur, peak, filterF0, filterF1, delay) {
-    if (!ensure() || ctx.state !== 'running') return;
+  // noise burst with a stepped volume staircase
+  function noise(clockHz, steps, stepDur, lowpass, delay) {
     const t0 = ctx.currentTime + (delay || 0);
     const src = ctx.createBufferSource();
-    src.buffer = noiseBuf;
+    src.buffer = noiseBuffer(clockHz);
     src.loop = true;
-    const filt = ctx.createBiquadFilter();
-    filt.type = 'lowpass';
-    filt.frequency.setValueAtTime(filterF0, t0);
-    filt.frequency.exponentialRampToValueAtTime(Math.max(20, filterF1), t0 + dur);
     const g = ctx.createGain();
-    env(g, t0, peak, dur);
-    src.connect(filt);
-    filt.connect(g);
+    let node = src;
+    if (lowpass) {
+      const f = ctx.createBiquadFilter();
+      f.type = 'lowpass';
+      f.frequency.value = lowpass;
+      src.connect(f);
+      node = f;
+    }
+    node.connect(g);
     g.connect(master);
+    for (let i = 0; i < steps.length; i++) g.gain.setValueAtTime(steps[i], t0 + i * stepDur);
+    const total = steps.length * stepDur;
+    g.gain.setValueAtTime(0.0001, t0 + total);
     src.start(t0);
-    src.stop(t0 + dur + 0.02);
+    src.stop(t0 + total + 0.02);
   }
 
+  // ---------------------------------------------------------------- effects
   const FX = {
-    fire: function () { tone('square', 900, 250, 0.07, 0.25); },
-    brick: function () { noise(0.06, 0.3, 1800, 400); },
-    steel: function () { tone('square', 1800, 1200, 0.04, 0.2); },
-    boom: function () { noise(0.35, 0.5, 1200, 60); tone('square', 120, 40, 0.3, 0.3); },
-    bigboom: function () { noise(0.6, 0.6, 900, 40); tone('square', 90, 30, 0.5, 0.4); },
-    pwSpawn: function () { tone('square', 520, 520, 0.08, 0.25); tone('square', 780, 780, 0.08, 0.25, 0.09); },
-    pwGet: function () {
-      const n = [660, 880, 1100, 1320];
-      for (let i = 0; i < n.length; i++) tone('square', n[i], n[i], 0.07, 0.22, i * 0.07);
+    // pulse1, 50% duty, sweep drags 1165 Hz down to 66 Hz then mutes
+    fire() {
+      const f = [1165, 938, 755, 607, 488, 391, 313, 251, 201, 161, 129, 103, 82, 66];
+      voice({ duty: 0.5, freqs: f, step: 0.01041, gain: 0.26, env: 'flat', total: 0.14 });
     },
-    pwEnemy: function () { // ominous falling tones: an enemy grabbed the item
-      const n = [880, 660, 440, 330];
-      for (let i = 0; i < n.length; i++) tone('square', n[i], n[i], 0.08, 0.22, i * 0.08);
+    // triangle, three quick pitches
+    brick() {
+      voice({ type: 'triangle', freqs: [164.5, 246.4, 139.5], step: FRAME, gain: 0.34, env: 'flat', total: 0.055 });
     },
-    life: function () {
-      const n = [523, 659, 784, 1046, 784, 1046];
-      for (let i = 0; i < n.length; i++) tone('square', n[i], n[i], 0.09, 0.22, i * 0.09);
+    // pulse2, hard tink an octave apart
+    steel() {
+      voice({ duty: 0.25, freqs: [1045, 2071], step: FRAME * 2, gain: 0.12, env: 'flat', total: 0.067 });
     },
-    tick: function () { tone('square', 1000, 1000, 0.03, 0.15); },
-    pause: function () { tone('square', 440, 440, 0.08, 0.2); tone('square', 330, 330, 0.1, 0.2, 0.1); },
-    playerBoom: function () { noise(0.5, 0.55, 1000, 50); tone('sawtooth', 200, 30, 0.45, 0.3); },
+    // armour ping: bright short tick
+    hit() {
+      voice({ duty: 0.25, freqs: [2601, 2728], step: FRAME, gain: 0.2, env: 'pluck', decay: 0.05, total: 0.05 });
+    },
+    // enemy explosion: white noise at 3523 Hz, 0.233 s
+    boom() {
+      noise(3523, [0.30, 0.30, 0.28, 0.28, 0.26, 0.25, 0.24, 0.23, 0.22], FRAME * 1.55, 1800);
+    },
+    // player explosion: deeper noise, manual volume staircase, 0.433 s
+    playerBoom() {
+      const v = [15, 15, 14, 14, 13, 13, 12, 12, 11, 11, 10, 9, 8].map((x) => 0.30 * x / 15);
+      noise(1762, v, FRAME * 2, 900);
+    },
+    // base destroyed: descending 12.5% pulse plus the player-explosion noise
+    bigboom() {
+      voice({
+        duty: 0.125, freqs: [261.4, 246.4, 195.6, 155.4, 130.7, 123.3, 97.9, 77.7, 65.4],
+        step: FRAME * 3, gain: 0.24, env: 12,
+      });
+      const v = [15, 15, 14, 14, 13, 13, 12, 12, 11, 11, 10, 9, 8].map((x) => 0.26 * x / 15);
+      noise(1762, v, FRAME * 2, 900);
+    },
+    // power-up appears
+    pwSpawn() {
+      voice({
+        duty: 0.25, freqs: [391, 329, 391, 439, 391, 439, 493, 523],
+        step: FRAME * 4, gain: 0.2, env: 12,
+      });
+    },
+    // power-up collected: three rising arpeggios
+    pwGet() {
+      voice({
+        duty: 0.5,
+        freqs: [391, 523, 658, 782, 369, 493, 621, 736, 523, 658, 782, 1045, 1316],
+        step: FRAME * 3, gain: 0.22, env: 'pluck', decay: 0.078,
+      });
+    },
+    // an enemy took the item: our own cue, low and ominous
+    pwEnemy() {
+      voice({
+        duty: 0.125, freqs: [523, 440, 349, 262, 208], step: FRAME * 4,
+        gain: 0.2, env: 'pluck', decay: 0.1,
+      });
+    },
+    // extra life: two pulse voices
+    life() {
+      voice({
+        duty: 0.5, freqs: [1045, 1316, 1045, 782, 1045, 1316, 1748, 1554, 1554, 1554],
+        step: 0.0998, gain: 0.18, env: 12,
+      });
+      voice({
+        duty: 0.5, freqs: [658, 782, 658, 523, 658, 782, 1045, 981, 981],
+        step: 0.0998, gain: 0.16, env: 12, delay: FRAME * 2,
+      });
+    },
+    // pause
+    pause() {
+      voice({
+        duty: 0.5, freqs: [523, 586, 658, 1045, 1165, 1316, 782, 782, 782],
+        step: FRAME * 4, gain: 0.2, env: 'pluck', decay: 0.234,
+      });
+    },
+    // score tally tick: pulse blip plus a short metallic noise
+    tick() {
+      voice({ duty: 0.5, freqs: [164.5], step: 0.021, gain: 0.18, env: 'pluck', decay: 0.021 });
+      noise(27965, [0.12], 0.042, 4000);
+    },
   };
+  FX.enemyHit = FX.hit;
 
   BC.sfx = {
     unlock: unlock,
     ready: function () { return !!ctx && ctx.state === 'running'; },
     ctx: function () { return ensure(); },
     master: function () { return master; },
+    FRAME: FRAME,
+    voice: function (o) { if (ready()) voice(o); },
     play: function (name) {
-      if (muted || !FX[name]) return;
-      FX[name]();
+      if (!ready() || !FX[name]) return;
+      try { FX[name](); } catch (e) { /* audio graph hiccup - never break the game */ }
     },
     setMuted: function (m) {
       muted = m;
@@ -1611,93 +1735,82 @@
 })();
 
 // ==== src/core/music.js ====
-// Tiny NES-style sequencer for jingles (2 pulse + 1 triangle channel).
-// Original chiptune compositions in the spirit of the era - not the Namco tunes.
+// Stage-start and game-over cues, rebuilt from the NES sound engine's own
+// note/duration tables (three voices each: two pulses + triangle). These are
+// synthesized, not sampled.
 (function () {
-  // Note name -> frequency
-  const SEMIS = { C: 0, 'C#': 1, D: 2, 'D#': 3, E: 4, F: 5, 'F#': 6, G: 7, 'G#': 8, A: 9, 'A#': 10, B: 11 };
-  function freq(note) {
-    // e.g. 'E4', 'A#3'
-    const m = /^([A-G]#?)(\d)$/.exec(note);
-    if (!m) return 0;
-    const n = SEMIS[m[1]] + (parseInt(m[2], 10) + 1) * 12;
-    return 440 * Math.pow(2, (n - 69) / 12);
-  }
+  const F = 1 / 60.0988; // frame
 
-  // A jingle is [channelType, [note|null, beats] ...] tracks played together.
-  // Stage-start jingle: bold rising march figure.
-  const STAGE_JINGLE = {
-    bpm: 300,
-    tracks: [
-      { type: 'square', vol: 0.18, notes: [
-        ['E3', 2], ['E3', 1], ['E3', 1], ['G3', 2], ['E3', 2],
-        ['A3', 2], ['A3', 1], ['A3', 1], ['C4', 2], ['A3', 2],
-        ['B3', 2], ['D4', 2], ['E4', 4],
-      ] },
-      { type: 'triangle', vol: 0.22, notes: [
-        ['E2', 4], ['E2', 4], ['A2', 4], ['A2', 4], ['E2', 4], ['E2', 2], ['E2', 2],
-      ] },
-    ],
-  };
-
-  const GAMEOVER_JINGLE = {
-    bpm: 240,
-    tracks: [
-      { type: 'square', vol: 0.18, notes: [
-        ['E4', 2], ['C4', 2], ['A3', 2], ['F3', 3], [null, 1], ['E3', 2], ['D3', 2], ['C3', 6],
-      ] },
-      { type: 'triangle', vol: 0.22, notes: [
-        ['A2', 4], ['F2', 4], ['C2', 8],
-      ] },
-    ],
-  };
-
-  const WIN_JINGLE = {
-    bpm: 320,
-    tracks: [
-      { type: 'square', vol: 0.18, notes: [
-        ['C4', 1], ['E4', 1], ['G4', 1], ['C5', 2], ['G4', 1], ['C5', 4],
-      ] },
-      { type: 'triangle', vol: 0.22, notes: [
-        ['C3', 3], ['G2', 3], ['C3', 4],
-      ] },
-    ],
-  };
-
-  function playJingle(j) {
-    const ctx = BC.sfx.ctx();
-    if (!ctx || ctx.state !== 'running' || BC.sfx.isMuted()) return 0;
-    const beat = 60 / j.bpm;
-    const t0 = ctx.currentTime + 0.03;
-    let total = 0;
-    for (const tr of j.tracks) {
-      let t = t0;
-      for (const [note, beats] of tr.notes) {
-        const dur = beats * beat;
-        if (note) {
-          const osc = ctx.createOscillator();
-          const g = ctx.createGain();
-          osc.type = tr.type;
-          osc.frequency.value = freq(note);
-          g.gain.setValueAtTime(tr.vol, t);
-          g.gain.setValueAtTime(tr.vol, t + dur * 0.7);
-          g.gain.linearRampToValueAtTime(0.0001, t + dur * 0.95);
-          osc.connect(g);
-          g.connect(BC.sfx.master());
-          osc.start(t);
-          osc.stop(t + dur);
-        }
-        t += dur;
-      }
-      total = Math.max(total, t - t0);
+  // Build a stepped frequency list from [freq, frames] pairs by repeating each
+  // entry for its length, so one voice() call plays the whole line.
+  function line(pairs, unitFrames) {
+    const out = [];
+    for (const [f, frames] of pairs) {
+      const n = Math.max(1, Math.round(frames / unitFrames));
+      for (let i = 0; i < n; i++) out.push(f);
     }
-    return total * 1000; // duration in ms
+    return out;
   }
+
+  // ---- stage start: 264 frames (4.39 s). Cm -> Eb -> F -> Ab -> Bb -> C
+  const STAGE_PULSE1 = [
+    522.7, 585.7, 621.4, 522.7, 585.7, 621.4,
+    621.4, 694.8, 782.2, 621.4, 694.8, 782.2,
+    694.8, 782.2, 873.9, 694.8, 782.2, 873.9,
+    828.6, 924.5, 1045.4, 828.6, 924.5, 1045.4,
+    1045.4, 1045.4, 1045.4, 1045.4, 1045.4, 1045.4,
+    1045.4, 1045.4, 1045.4,
+  ];
+  // bass/harmony share the rhythm: a long hit then three short ones per bar
+  const BASS_RHYTHM = [24, 8, 8, 8];
+  function rhythmLine(notes) {
+    const pairs = [];
+    for (const f of notes) {
+      for (const len of BASS_RHYTHM) pairs.push([f, len]);
+    }
+    return pairs;
+  }
+  const STAGE_TRI = rhythmLine([130.7, 155.4, 174.2, 207.1, 232.1, 195.6]);
+  const STAGE_PULSE2 = rhythmLine([195.6, 232.6, 261.4, 310.7, 348.5, 329.0]);
+
+  // ---- game over: 108 frames (1.80 s), all three voices share the rhythm
+  const GO_LEN = [6, 6, 24, 8, 8, 8, 8, 8, 8, 24];
+  function goLine(freqs) {
+    const pairs = [];
+    for (let i = 0; i < freqs.length; i++) pairs.push([freqs[i], GO_LEN[i]]);
+    return pairs;
+  }
+  const GO_P1 = goLine([522.7, 464.2, 522.7, 391.1, 348.5, 310.7, 261.4, 261.4, 261.4, 261.4]);
+  const GO_P2 = goLine([391.1, 391.1, 391.1, 310.7, 292.8, 246.4, 261.4, 261.4, 261.4, 261.4]);
+  const GO_TRI = goLine([329.0, 310.7, 329.0, 261.4, 232.1, 195.6, 195.6, 195.6, 195.6, 195.6]);
 
   BC.music = {
-    stageStart: function () { return playJingle(STAGE_JINGLE); },
-    gameOver: function () { return playJingle(GAMEOVER_JINGLE); },
-    win: function () { return playJingle(WIN_JINGLE); },
+    stageStart() {
+      const v = BC.sfx.voice.bind(BC.sfx);
+      // arpeggio: one pluck every 8 frames
+      v({ duty: 0.5, freqs: STAGE_PULSE1, step: F * 8, gain: 0.16, env: 'pluck', decay: 0.156 });
+      // bass + harmony on the shared rhythm (2-frame grid keeps the hits crisp)
+      v({ type: 'triangle', freqs: line(STAGE_TRI, 2), step: F * 2, gain: 0.26, env: 'pluck', decay: 0.083 });
+      v({ duty: 0.5, freqs: line(STAGE_PULSE2, 2), step: F * 2, gain: 0.14, env: 'pluck', decay: 0.156 });
+      return 264 * F * 1000;
+    },
+
+    gameOver() {
+      const v = BC.sfx.voice.bind(BC.sfx);
+      v({ duty: 0.25, freqs: line(GO_P1, 2), step: F * 2, gain: 0.17, env: 'pluck', decay: 0.234 });
+      v({ duty: 0.5, freqs: line(GO_P2, 2), step: F * 2, gain: 0.15, env: 'pluck', decay: 0.234 });
+      v({ type: 'triangle', freqs: line(GO_TRI, 2), step: F * 2, gain: 0.26, env: 'pluck', decay: 0.083 });
+      return 108 * F * 1000;
+    },
+
+    // short rising flourish, used when a run ends well
+    win() {
+      BC.sfx.voice({
+        duty: 0.5, freqs: [523, 658, 782, 1045, 782, 1045, 1045, 1045],
+        step: F * 6, gain: 0.18, env: 'pluck', decay: 0.156,
+      });
+      return 48 * F * 1000;
+    },
   };
 })();
 
@@ -3524,7 +3637,7 @@
     hit() {
       if (!this.alive) return false;
       if (this.isShielded()) {
-        BC.sfx.play('steel');
+        BC.sfx.play('hit');
         return false;
       }
       if (this.flashing) {
@@ -3535,7 +3648,7 @@
       }
       this.hp -= 1;
       if (this.hp > 0) {
-        BC.sfx.play('steel');
+        BC.sfx.play('hit'); // armour ping: survived the shot
         return false;
       }
       this.alive = false;

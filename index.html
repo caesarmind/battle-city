@@ -121,7 +121,7 @@
 
   // Build version, exchanged in the online handshake: both players must run
   // the same build so locally-constructed stages match the host's simulation.
-  BC.VERSION = '5.7';
+  BC.VERSION = '5.8';
 
   // Live per-run state (reset by GameScene on new game)
   BC.session = null;
@@ -256,6 +256,11 @@
       return v && typeof v === 'object' ? v : {};
     },
     setCustomStages: function (obj) { set('bc.stages', obj || {}); },
+    getTexturePack: function () {
+      const v = get('bc.texpack', null);
+      return Array.isArray(v) ? v : null;
+    },
+    setTexturePack: function (files) { set('bc.texpack', files || null); },
   };
 })();
 
@@ -1283,7 +1288,11 @@
   }
 
   // Tank art uses T for tracks; stamp tread stripes by animation frame.
-  function drawTank(ctx, art, pal, x, y, frame) {
+  // Tanks are authored facing UP and baked into all four headings so a loaded
+  // texture pack can supply genuinely different per-direction art (the NES
+  // sprites are not pure rotations of each other).
+  // dir: 0 up, 1 right, 2 down, 3 left (clockwise, matching BC.DIR)
+  function drawTank(ctx, art, pal, x, y, frame, dir) {
     for (let r = 0; r < 16; r++) {
       const row = art[r];
       if (row.length !== 16) throw new Error('texgen: tank row ' + r + ' len ' + row.length);
@@ -1296,8 +1305,12 @@
         } else {
           color = pal[ch];
         }
+        let dx = c, dy = r;
+        if (dir === 1) { dx = 15 - r; dy = c; }        // 90 clockwise
+        else if (dir === 2) { dx = 15 - c; dy = 15 - r; } // 180
+        else if (dir === 3) { dx = r; dy = 15 - c; }   // 270
         ctx.fillStyle = color;
-        ctx.fillRect(x + c, y + r, 1, 1);
+        ctx.fillRect(x + dx, y + dy, 1, 1);
       }
     }
   }
@@ -1320,23 +1333,32 @@
         return f;
       }
 
-      // player tanks: tier 0..3 x frames a/b, in P1 gold (p) and P2 green (q)
+      // player tanks: tier 0..3 x direction x frame, P1 gold (p) / P2 green (q)
+      const tankRects = {};
       for (let tier = 0; tier < 4; tier++) {
         for (const [key, pal] of [['p', PAL.player], ['q', PAL.player2]]) {
-          for (let fr = 0; fr < 2; fr++) {
-            const f = place('tank_' + key + tier + '_' + fr, 16, 16);
-            drawTank(ctx, PLAYER_ARTS[tier], pal, f.x, f.y, fr);
+          for (let dir = 0; dir < 4; dir++) {
+            for (let fr = 0; fr < 2; fr++) {
+              const name = 'tank_' + key + tier + '_' + dir + '_' + fr;
+              const f = place(name, 16, 16);
+              tankRects[name] = f;
+              drawTank(ctx, PLAYER_ARTS[tier], pal, f.x, f.y, fr, dir);
+            }
           }
         }
       }
-      // enemy tanks: type x palette x frame (palette encodes remaining HP)
+      // enemy tanks: type x palette x direction x frame (palette = remaining HP)
       const enemyArts = [ENEMY_BASIC, ENEMY_FAST, ENEMY_POWER, ENEMY_MASSIVE];
       const enemyPals = { n: PAL.enemy, r: PAL.red, h4: PAL.h4, h3: PAL.h3, h2: PAL.h2 };
       for (let t = 0; t < 4; t++) {
         for (const p of ['n', 'r', 'h4', 'h3', 'h2']) {
-          for (let fr = 0; fr < 2; fr++) {
-            const f = place('tank_e' + t + '_' + p + '_' + fr, 16, 16);
-            drawTank(ctx, enemyArts[t], enemyPals[p], f.x, f.y, fr);
+          for (let dir = 0; dir < 4; dir++) {
+            for (let fr = 0; fr < 2; fr++) {
+              const name = 'tank_e' + t + '_' + p + '_' + dir + '_' + fr;
+              const f = place(name, 16, 16);
+              tankRects[name] = f;
+              drawTank(ctx, enemyArts[t], enemyPals[p], f.x, f.y, fr, dir);
+            }
           }
         }
       }
@@ -1428,6 +1450,10 @@
       for (const fr of frames) {
         tex.add(fr.name, 0, fr.x, fr.y, fr.w, fr.h);
       }
+      // a texture pack repaints these same rectangles (see texpack.js)
+      BC.atlasRects = {};
+      for (const fr of frames) BC.atlasRects[fr.name] = fr;
+      BC.atlasCanvas = canvas;
 
       // ---- tileset canvas: index order must match BC.T values
       // 0 empty, 1 brick, 2 steel, 3 water(A), 4 trees, 5 ice, 6 water(B),
@@ -1453,6 +1479,7 @@
         tctx.clearRect(idx * 8 + cx, cy, cw, ch);
       }
       textures.addCanvas('tiles', tc);
+      BC.tileCanvas = tc;
       // named frames so the gallery can show tile swatches
       const ttex = textures.get('tiles');
       ttex.add('tile_brick', 0, 8, 0, 8, 8);
@@ -1494,6 +1521,221 @@
         lineSpacing: 0,
       });
       scene.cache.bitmapFont.add('font', fontData);
+    },
+  };
+})();
+
+// ==== src/core/texpack.js ====
+// Optional texture pack: repaint the generated atlas from PNG files the player
+// supplies from their own machine. Files are read locally in the browser and
+// kept in this browser's storage; no artwork ships with the game.
+//
+// Expected files (any subset; names are matched case-insensitively and may
+// carry a path prefix):
+//   player1.png / player2.png  8 cols x 4 rows of 16px sprites, scaled:
+//                              col = direction*2 + frame, row = star tier
+//   enemies.png                same grid, row = tank type
+//   enemies_with_powerups.png  same grid, the flashing bonus variant
+//   brick / concrete / forest / ice / river1 / river2   one terrain tile each
+//   bullet, shield, born, powerup, flag, deadFlag       misc sprites
+//
+// Source sheets may be at any integer scale - sizes are derived from the image.
+(function () {
+  // their sheets order directions up, left, down, right; ours is
+  // up, right, down, left (BC.DIR), so remap the column group
+  const DIR_COL = [0, 3, 2, 1];
+
+  function drawScaled(ctx, img, sx, sy, sw, sh, dx, dy, dw, dh) {
+    ctx.imageSmoothingEnabled = false;
+    ctx.clearRect(dx, dy, dw, dh);
+    ctx.drawImage(img, sx, sy, sw, sh, dx, dy, dw, dh);
+  }
+
+  // paint one atlas frame from a source region
+  function paint(ctx, img, sx, sy, sw, sh, name) {
+    const r = BC.atlasRects && BC.atlasRects[name];
+    if (!r) return false;
+    drawScaled(ctx, img, sx, sy, sw, sh, r.x, r.y, r.w, r.h);
+    return true;
+  }
+
+  // a tank sheet: 8 columns (dir*2+frame) x N rows, each cell square
+  function paintTankSheet(ctx, img, rows, nameFor) {
+    const cw = img.width / 8;
+    const ch = img.height / rows;
+    let n = 0;
+    for (let row = 0; row < rows; row++) {
+      for (let dir = 0; dir < 4; dir++) {
+        for (let fr = 0; fr < 2; fr++) {
+          const col = DIR_COL[dir] * 2 + fr;
+          const name = nameFor(row, dir, fr);
+          if (paint(ctx, img, col * cw, row * ch, cw, ch, name)) n++;
+        }
+      }
+    }
+    return n;
+  }
+
+  // tint a already-painted frame (used for the armour HP colours, which the
+  // original sheets do not contain as separate art)
+  function tintFrom(ctx, srcName, dstName, color, alpha) {
+    const s = BC.atlasRects[srcName];
+    const d = BC.atlasRects[dstName];
+    if (!s || !d) return;
+    ctx.clearRect(d.x, d.y, d.w, d.h);
+    ctx.drawImage(BC.atlasCanvas, s.x, s.y, s.w, s.h, d.x, d.y, d.w, d.h);
+    ctx.save();
+    ctx.globalCompositeOperation = 'source-atop';
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = color;
+    ctx.fillRect(d.x, d.y, d.w, d.h);
+    ctx.restore();
+  }
+
+  function baseName(path) {
+    const s = String(path).replace(/\\/g, '/');
+    return s.slice(s.lastIndexOf('/') + 1).replace(/\.[^.]*$/, '').toLowerCase();
+  }
+
+  BC.texpack = {
+    active: false,
+
+    // images: { name -> HTMLImageElement }
+    apply(images, textures) {
+      if (!BC.atlasRects || !BC.atlasCanvas) return { ok: false, error: 'ATLAS NOT READY' };
+      const ctx = BC.atlasCanvas.getContext('2d');
+      const tctx = BC.tileCanvas ? BC.tileCanvas.getContext('2d') : null;
+      let painted = 0;
+      const got = (n) => images[n];
+
+      // ---- tanks
+      if (got('player1')) {
+        painted += paintTankSheet(ctx, got('player1'), 4,
+          (row, dir, fr) => 'tank_p' + row + '_' + dir + '_' + fr);
+      }
+      if (got('player2')) {
+        painted += paintTankSheet(ctx, got('player2'), 4,
+          (row, dir, fr) => 'tank_q' + row + '_' + dir + '_' + fr);
+      }
+      if (got('enemies')) {
+        painted += paintTankSheet(ctx, got('enemies'), 4,
+          (row, dir, fr) => 'tank_e' + row + '_n_' + dir + '_' + fr);
+        // damage colours: tint the base sprite (green / gold / silver)
+        const tints = { h4: ['#00a800', 0.55], h3: ['#fca044', 0.5], h2: ['#ffffff', 0.35] };
+        for (let t = 0; t < 4; t++) {
+          for (const key of Object.keys(tints)) {
+            for (let dir = 0; dir < 4; dir++) {
+              for (let fr = 0; fr < 2; fr++) {
+                tintFrom(ctx,
+                  'tank_e' + t + '_n_' + dir + '_' + fr,
+                  'tank_e' + t + '_' + key + '_' + dir + '_' + fr,
+                  tints[key][0], tints[key][1]);
+              }
+            }
+          }
+        }
+      }
+      const flashSheet = got('enemies_with_powerups') || got('enemies_with_powerup');
+      if (flashSheet) {
+        painted += paintTankSheet(ctx, flashSheet, 4,
+          (row, dir, fr) => 'tank_e' + row + '_r_' + dir + '_' + fr);
+      }
+
+      // ---- misc sprites
+      if (got('bullet')) {
+        // 4 directions across; ours is a single rotated frame - take 'up'
+        const img = got('bullet');
+        const cw = img.width / 4;
+        paint(ctx, img, 0, 0, cw, img.height, 'bullet');
+      }
+      if (got('shield')) {
+        const img = got('shield');
+        const ch = img.height / 2;
+        paint(ctx, img, 0, 0, img.width, ch, 'shield0');
+        paint(ctx, img, 0, ch, img.width, ch, 'shield1');
+      }
+      if (got('born')) {
+        const img = got('born');
+        const cw = img.width / 4;
+        for (let i = 0; i < 4; i++) paint(ctx, img, i * cw, 0, cw, img.height, 'spawn' + i);
+      }
+      if (got('flag')) paint(ctx, got('flag'), 0, 0, got('flag').width, got('flag').height, 'eagle');
+      if (got('deadflag')) paint(ctx, got('deadflag'), 0, 0, got('deadflag').width, got('deadflag').height, 'eagle_dead');
+      if (got('powerup')) {
+        // one strip of six: their order is tank, clock, shovel, grenade, star, helmet
+        const img = got('powerup');
+        const cw = img.width / 6;
+        const order = [5, 1, 2, 4, 3, 0]; // -> BC.POWERUP indices
+        for (let i = 0; i < 6; i++) paint(ctx, img, i * cw, 0, cw, img.height, 'pw' + order[i]);
+      }
+
+      // ---- terrain tiles (tileset indices must match terrain.js)
+      if (tctx) {
+        const tile = (img, idx) => {
+          // our cell is 8px = the top-left quarter of a 16px tile
+          tctx.imageSmoothingEnabled = false;
+          tctx.clearRect(idx * 8, 0, 8, 8);
+          tctx.drawImage(img, 0, 0, img.width / 2, img.height / 2, idx * 8, 0, 8, 8);
+        };
+        if (got('brick')) { tile(got('brick'), 1); painted++; }
+        if (got('concrete')) { tile(got('concrete'), 2); painted++; }
+        if (got('river1')) { tile(got('river1'), 3); painted++; }
+        if (got('forest')) { tile(got('forest'), 4); painted++; }
+        if (got('ice')) { tile(got('ice'), 5); painted++; }
+        if (got('river2')) { tile(got('river2'), 6); painted++; }
+        // rebuild the half-brick states from the new brick tile
+        if (got('brick')) {
+          for (const [idx, cx, cy, cw2, ch2] of [
+            [7, 0, 4, 8, 4], [8, 0, 0, 8, 4], [9, 4, 0, 4, 8], [10, 0, 0, 4, 8],
+          ]) {
+            tctx.clearRect(idx * 8, 0, 8, 8);
+            tctx.drawImage(BC.tileCanvas, 8, 0, 8, 8, idx * 8, 0, 8, 8);
+            tctx.clearRect(idx * 8 + cx, cy, cw2, ch2);
+          }
+        }
+      }
+
+      if (!painted) return { ok: false, error: 'NO USABLE IMAGES' };
+      const atlas = textures.get('atlas');
+      if (atlas && atlas.refresh) atlas.refresh();
+      const tiles = textures.get('tiles');
+      if (tiles && tiles.refresh) tiles.refresh();
+      this.active = true;
+      return { ok: true, count: painted };
+    },
+
+    // files: [{ name, dataUrl }] -> decode then apply
+    applyFiles(files, textures) {
+      const images = {};
+      let pending = files.length;
+      return new Promise((resolve) => {
+        if (!pending) { resolve({ ok: false, error: 'NO FILES' }); return; }
+        for (const f of files) {
+          const img = new Image();
+          img.onload = () => {
+            images[baseName(f.name)] = img;
+            if (--pending === 0) resolve(this.apply(images, textures));
+          };
+          img.onerror = () => {
+            if (--pending === 0) resolve(this.apply(images, textures));
+          };
+          img.src = f.dataUrl;
+        }
+      });
+    },
+
+    save(files) { BC.storage.setTexturePack(files); },
+    stored() { return BC.storage.getTexturePack(); },
+    clear() {
+      BC.storage.setTexturePack(null);
+      this.active = false;
+    },
+
+    // re-apply a stored pack at boot
+    restore(textures) {
+      const files = this.stored();
+      if (!files || !files.length) return Promise.resolve({ ok: false });
+      return this.applyFiles(files, textures);
     },
   };
 })();
@@ -3223,7 +3465,7 @@
       this.animFrame = 0;
       this.animDist = 0;
       this.skid = 0;
-      this.sprite = scene.add.sprite(0, 0, 'atlas', opts.frameBase + '_0')
+      this.sprite = scene.add.sprite(0, 0, 'atlas', opts.frameBase + '_0_0')
         .setDepth(BC.DEPTH.TANK);
       this.syncSprite();
     }
@@ -3235,13 +3477,15 @@
 
     setFrameBase(base) {
       this.frameBase = base;
-      this.sprite.setFrame(base + '_' + this.animFrame);
+      this.sprite.setFrame(base + '_' + this.dir + '_' + this.animFrame);
     }
 
+    // Direction lives in the frame, not in sprite rotation, so per-direction
+    // artwork from a texture pack renders correctly.
     syncSprite() {
       this.sprite.x = this.scene.fieldOx + this.x;
       this.sprite.y = this.scene.fieldOy + this.y;
-      this.sprite.angle = this.dir * 90;
+      this.sprite.setFrame(this.frameBase + '_' + this.dir + '_' + this.animFrame);
     }
 
     rect() {
@@ -3366,7 +3610,7 @@
       if (this.animDist >= 4) {
         this.animDist = 0;
         this.animFrame ^= 1;
-        this.sprite.setFrame(this.frameBase + '_' + this.animFrame);
+        this.sprite.setFrame(this.frameBase + '_' + this.dir + '_' + this.animFrame);
       }
     }
 
@@ -4551,6 +4795,11 @@
     create() {
       BC.texgen.build(this.textures);
       BC.texgen.buildFont(this);
+      // a texture pack the player loaded earlier repaints the generated atlas
+      const pack = BC.texpack.stored();
+      if (pack && pack.length) {
+        BC.texpack.applyFiles(pack, this.textures).catch(() => {});
+      }
 
       // audio unlock on the very first gesture (iOS/Android autoplay policy)
       const unlock = () => BC.sfx.unlock();
@@ -4748,6 +4997,21 @@
         this.pickRom();
       });
       this.root.add(rom);
+      // optional texture pack, loaded from the player's own image files
+      const hasPack = !!(BC.texpack.stored() || []).length;
+      const texLabel = hasPack ? 'CLEAR TEXTURE PACK' : 'LOAD TEXTURE PACK';
+      const tex = BC.mkText(this, W / 2, botY + 56, texLabel, 7, '#909090')
+        .setOrigin(0.5).setInteractive({ useHandCursor: true });
+      tex.on('pointerdown', () => {
+        if (hasPack) {
+          BC.texpack.clear();
+          this.romMsg = 'RELOAD PAGE TO RESTORE ART';
+          this.buildUI();
+          return;
+        }
+        this.pickTextures();
+      });
+      this.root.add(tex);
     }
 
     moveSel(d) {
@@ -4802,6 +5066,50 @@
         }
       });
       input.click();
+    }
+
+    // Load PNG sprite sheets from the player's own machine and repaint the
+    // generated atlas with them. Files stay in this browser.
+    pickTextures() {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.multiple = true;
+      input.accept = 'image/png,image/*';
+      input.style.display = 'none';
+      document.body.appendChild(input);
+      input.addEventListener('change', () => {
+        const files = Array.from(input.files || []);
+        document.body.removeChild(input);
+        if (!files.length) return;
+        const loaded = [];
+        let pending = files.length;
+        for (const file of files) {
+          const reader = new FileReader();
+          reader.onload = () => {
+            loaded.push({ name: file.name, dataUrl: reader.result });
+            if (--pending === 0) this._applyTextures(loaded);
+          };
+          reader.onerror = () => { if (--pending === 0) this._applyTextures(loaded); };
+          reader.readAsDataURL(file);
+        }
+      });
+      input.click();
+    }
+
+    _applyTextures(files) {
+      BC.texpack.applyFiles(files, this.textures).then((res) => {
+        if (res.ok) {
+          BC.texpack.save(files);
+          this.romMsg = 'TEXTURES LOADED!';
+        } else {
+          this.romMsg = res.error || 'TEXTURE LOAD FAILED';
+        }
+        BC.sfx.play(res.ok ? 'pwGet' : 'steel');
+        this.buildUI();
+      }).catch(() => {
+        this.romMsg = 'TEXTURE LOAD FAILED';
+        this.buildUI();
+      });
     }
 
     startSel() {
@@ -4969,26 +5277,26 @@
       title: 'PLAYER TANKS',
       subtitle: 'YOU START WITH ONE STAR',
       rows: [
-        { cycle: ['tank_p1_0', 'tank_p1_1'], name: '1 STAR', desc: 'FAST SHOT. START TIER' },
-        { cycle: ['tank_p2_0', 'tank_p2_1'], name: '2 STARS', desc: 'TWO BULLETS AT ONCE' },
-        { cycle: ['tank_p3_0', 'tank_p3_1'], name: '3 STARS', desc: 'BREAKS STEEL WALLS' },
-        { cycle: ['tank_q1_0', 'tank_q1_1'], name: 'PLAYER 2', desc: 'GREEN TANK IN 2P MODE' },
+        { cycle: ['tank_p1_0_0', 'tank_p1_0_1'], name: '1 STAR', desc: 'FAST SHOT. START TIER' },
+        { cycle: ['tank_p2_0_0', 'tank_p2_0_1'], name: '2 STARS', desc: 'TWO BULLETS AT ONCE' },
+        { cycle: ['tank_p3_0_0', 'tank_p3_0_1'], name: '3 STARS', desc: 'BREAKS STEEL WALLS' },
+        { cycle: ['tank_q1_0_0', 'tank_q1_0_1'], name: 'PLAYER 2', desc: 'GREEN TANK IN 2P MODE' },
       ],
     },
     {
       title: 'ENEMY TANKS',
       rows: [
-        { cycle: ['tank_e0_n_0', 'tank_e0_n_1'], name: 'BASIC', desc: '100 PTS. STEADY' },
-        { cycle: ['tank_e1_n_0', 'tank_e1_n_1'], name: 'FAST', desc: '200 PTS. VERY QUICK' },
-        { cycle: ['tank_e2_n_0', 'tank_e2_n_1'], name: 'POWER', desc: '300 PTS. FAST BULLETS' },
-        { cycle: ['tank_e3_h4_0', 'tank_e3_h4_1'], name: 'MASSIVE', desc: '400 PTS. 4HP TWIN GUN' },
+        { cycle: ['tank_e0_n_0_0', 'tank_e0_n_0_1'], name: 'BASIC', desc: '100 PTS. STEADY' },
+        { cycle: ['tank_e1_n_0_0', 'tank_e1_n_0_1'], name: 'FAST', desc: '200 PTS. VERY QUICK' },
+        { cycle: ['tank_e2_n_0_0', 'tank_e2_n_0_1'], name: 'POWER', desc: '300 PTS. FAST BULLETS' },
+        { cycle: ['tank_e3_h4_0_0', 'tank_e3_h4_0_1'], name: 'MASSIVE', desc: '400 PTS. 4HP TWIN GUN' },
         {
-          cycle: ['tank_e0_h4_0', 'tank_e0_h4_1', 'tank_e0_h3_0', 'tank_e0_h3_1',
-            'tank_e0_h2_0', 'tank_e0_h2_1', 'tank_e0_n_0', 'tank_e0_n_1'],
+          cycle: ['tank_e0_h4_0_0', 'tank_e0_h4_0_1', 'tank_e0_h3_0_0', 'tank_e0_h3_0_1',
+            'tank_e0_h2_0_0', 'tank_e0_h2_0_1', 'tank_e0_n_0_0', 'tank_e0_n_0_1'],
           name: 'ARMORED', desc: 'EXTRA HITS. ANY TANK',
-          swatches: ['tank_e0_h4_0', 'tank_e0_h3_0', 'tank_e0_h2_0', 'tank_e0_n_0'],
+          swatches: ['tank_e0_h4_0_0', 'tank_e0_h3_0_0', 'tank_e0_h2_0_0', 'tank_e0_n_0_0'],
         },
-        { cycle: ['tank_e0_r_0', 'tank_e0_r_1', 'tank_e0_n_0', 'tank_e0_n_1'], name: 'BONUS', desc: 'FLASHING. DROPS ITEM' },
+        { cycle: ['tank_e0_r_0_0', 'tank_e0_r_0_1', 'tank_e0_n_0_0', 'tank_e0_n_0_1'], name: 'BONUS', desc: 'FLASHING. DROPS ITEM' },
       ],
     },
     {

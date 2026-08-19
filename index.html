@@ -121,7 +121,7 @@
 
   // Build version, exchanged in the online handshake: both players must run
   // the same build so locally-constructed stages match the host's simulation.
-  BC.VERSION = '5.4';
+  BC.VERSION = '5.5';
 
   // Live per-run state (reset by GameScene on new game)
   BC.session = null;
@@ -2469,6 +2469,121 @@
   };
 })();
 
+// ==== src/data/romimport.js ====
+// Import stage layouts from a Battle City (NES) ROM the player supplies.
+// The file is read locally in the browser and never uploaded; no original
+// level data ships with this game.
+//
+// Format (from the ROM's own draw routine, sub_F000_draw_stage):
+//   tbl_F07A_stage_data holds 36 entries (35 stages + the attract-mode stage)
+//   of 91 bytes each, at a fixed stride - no pointer table.
+//   Each entry is 13 rows x 7 bytes; each row is 14 nibbles, high nibble
+//   first: 13 blocks of 16x16 px plus one padding nibble (always 0x0D).
+//   A nibble is one 16px block, and half-block values expand losslessly into
+//   the 2x2 group of 8px cells our terrain grid uses.
+(function () {
+  const STAGE_BYTES = 91;
+  const STAGE_COUNT = 36;      // 35 stages + demo
+  const TABLE_FROM_PRG_END = 0x0F86; // table start = prgStart + prgSize - this
+
+  // nibble -> 2x2 cells [[TL, TR], [BL, BR]] as map characters
+  function expand(v) {
+    const E = '.';
+    if (v <= 9) {
+      const t = v <= 4 ? '#' : '@';       // brick or steel
+      switch (v <= 4 ? v : v - 5) {
+        case 0: return [[E, t], [E, t]];  // right half
+        case 1: return [[E, E], [t, t]];  // bottom half
+        case 2: return [[t, E], [t, E]];  // left half
+        case 3: return [[t, t], [E, E]];  // top half
+        default: return [[t, t], [t, t]]; // full
+      }
+    }
+    if (v === 0x0A) return [['~', '~'], ['~', '~']];
+    if (v === 0x0B) return [['%', '%'], ['%', '%']];
+    if (v === 0x0C) return [['-', '-'], ['-', '-']];
+    return [[E, E], [E, E]]; // 0x0D empty (0x0E/0x0F unused)
+  }
+
+  function tableLooksRight(rom, off) {
+    if (off < 0 || off + STAGE_COUNT * STAGE_BYTES > rom.length) return false;
+    for (let s = 0; s < STAGE_COUNT; s++) {
+      for (let r = 0; r < 13; r++) {
+        const base = off + s * STAGE_BYTES + r * 7;
+        if ((rom[base + 6] & 0x0F) !== 0x0D) return false; // row padding nibble
+        for (let i = 0; i < 7; i++) {
+          if ((rom[base + i] >> 4) >= 0x0E) return false;
+          if (i < 6 && (rom[base + i] & 0x0F) >= 0x0E) return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  function findTable(rom) {
+    const isINes = rom[0] === 0x4E && rom[1] === 0x45 && rom[2] === 0x53 && rom[3] === 0x1A;
+    if (isINes) {
+      const prgStart = 16 + ((rom[6] & 0x04) ? 512 : 0);
+      const prgSize = rom[4] * 16384;
+      const off = prgStart + prgSize - TABLE_FROM_PRG_END;
+      if (tableLooksRight(rom, off)) return off;
+    }
+    // headerless dump or an odd variant: scan for a table that validates
+    for (let off = 0; off + STAGE_COUNT * STAGE_BYTES <= rom.length; off++) {
+      if (rom[off] === 0xDD && rom[off + 1] === 0xDD && tableLooksRight(rom, off)) return off;
+    }
+    return -1;
+  }
+
+  // decode one entry into 26 strings of 26 chars
+  function decodeStage(rom, off) {
+    const grid = [];
+    for (let i = 0; i < 26; i++) grid.push(new Array(26).fill('.'));
+    for (let r = 0; r < 13; r++) {
+      for (let c = 0; c < 13; c++) {
+        const k = r * 14 + c;                       // nibble index, 14 per row
+        const byte = rom[off + (k >> 1)];
+        const v = (k & 1) === 0 ? (byte >> 4) : (byte & 0x0F);
+        const q = expand(v);
+        grid[r * 2][c * 2] = q[0][0];
+        grid[r * 2][c * 2 + 1] = q[0][1];
+        grid[r * 2 + 1][c * 2] = q[1][0];
+        grid[r * 2 + 1][c * 2 + 1] = q[1][1];
+      }
+    }
+    // the ROM redraws the base area after the stage, so clear it here too -
+    // our loadStage then stamps the eagle and its wall
+    for (let r = 22; r <= 25; r++) {
+      for (let c = 10; c <= 15; c++) grid[r][c] = '.';
+    }
+    return grid.map((row) => row.join(''));
+  }
+
+  BC.romImport = {
+    // returns { ok, error?, stages: { 1..35 }, demo }
+    parse(buffer) {
+      const rom = new Uint8Array(buffer);
+      const off = findTable(rom);
+      if (off < 0) {
+        return { ok: false, error: 'NO STAGE DATA FOUND' };
+      }
+      const stages = {};
+      for (let n = 1; n <= 35; n++) {
+        stages[n] = decodeStage(rom, off + (n - 1) * STAGE_BYTES);
+      }
+      return { ok: true, stages, demo: decodeStage(rom, off + 35 * STAGE_BYTES), offset: off };
+    },
+
+    // parse + save every stage; returns a short status string
+    install(buffer) {
+      const res = this.parse(buffer);
+      if (!res.ok) return res;
+      for (let n = 1; n <= 35; n++) BC.importStage(n, res.stages[n].join('\n'));
+      return { ok: true, count: 35 };
+    },
+  };
+})();
+
 // ==== src/game/terrain.js ====
 // Terrain: a 26x26 Uint8Array is the single source of truth for collision;
 // a blank Phaser tilemap (8px tiles, two layers) is purely the renderer.
@@ -4482,8 +4597,24 @@
         .setOrigin(0.5).setInteractive({ useHandCursor: true });
       mode.on('pointerdown', () => { this.mode2p = !this.mode2p; BC.sfx.play('tick'); this.buildUI(); });
       this.root.add(mode);
-      const hint = BC.mkText(this, W / 2, botY + 30, 'STAGE ' + this.sel + ': TAP AGAIN', 7, '#808080').setOrigin(0.5);
+      const hint = BC.mkText(this, W / 2, botY + 30, this.romMsg || ('STAGE ' + this.sel + ': TAP AGAIN'), 7,
+        this.romMsg ? '#48a048' : '#808080').setOrigin(0.5);
       this.root.add(hint);
+      // load stage layouts from a ROM the player owns (read locally)
+      const imported = Object.keys(BC.customStages || {}).length;
+      const romLabel = imported ? 'CLEAR IMPORTED MAPS' : 'LOAD MAPS FROM NES FILE';
+      const rom = BC.mkText(this, W / 2, botY + 44, romLabel, 7, '#909090')
+        .setOrigin(0.5).setInteractive({ useHandCursor: true });
+      rom.on('pointerdown', () => {
+        if (imported) {
+          BC.clearImportedStages();
+          this.romMsg = 'BUILT-IN MAPS RESTORED';
+          this.buildUI();
+          return;
+        }
+        this.pickRom();
+      });
+      this.root.add(rom);
     }
 
     moveSel(d) {
@@ -4495,6 +4626,40 @@
         BC.sfx.play('tick');
         this.buildUI();
       }
+    }
+
+    // Ask for a local .nes file and pull the stage layouts out of it. The file
+    // is read in the browser only - nothing is uploaded or stored except the
+    // decoded maps in this browser's own storage.
+    pickRom() {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = '.nes,.bin,application/octet-stream';
+      input.style.display = 'none';
+      document.body.appendChild(input);
+      input.addEventListener('change', () => {
+        const file = input.files && input.files[0];
+        document.body.removeChild(input);
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = () => {
+          let res;
+          try {
+            res = BC.romImport.install(reader.result);
+          } catch (e) {
+            res = { ok: false, error: 'COULD NOT READ FILE' };
+          }
+          this.romMsg = res.ok ? 'IMPORTED ' + res.count + ' MAPS!' : (res.error || 'IMPORT FAILED');
+          BC.sfx.play(res.ok ? 'pwGet' : 'steel');
+          this.buildUI();
+        };
+        reader.onerror = () => {
+          this.romMsg = 'COULD NOT READ FILE';
+          this.buildUI();
+        };
+        reader.readAsArrayBuffer(file);
+      });
+      input.click();
     }
 
     startSel() {

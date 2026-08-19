@@ -132,7 +132,7 @@
 
   // Build version, exchanged in the online handshake: both players must run
   // the same build so locally-constructed stages match the host's simulation.
-  BC.VERSION = '5.11';
+  BC.VERSION = '5.12';
 
   // Live per-run state (reset by GameScene on new game)
   BC.session = null;
@@ -1654,10 +1654,22 @@
 
       // ---- misc sprites
       if (got('bullet')) {
-        // 4 directions across; ours is a single rotated frame - take 'up'
+        // 4 directions across; ours is a single rotated frame - take 'up'.
+        // Source art fills nearly the whole 8x8 cell (a stout bar), much
+        // chunkier than our own compact generated bullet - shrink it on
+        // paint, centered, so it reads as a projectile rather than a block.
+        // Collision is position-only (terrain.strike), so this is cosmetic.
         const img = got('bullet');
         const cw = img.width / 4;
-        paint(ctx, img, 0, 0, cw, img.height, 'bullet');
+        const r = BC.atlasRects.bullet;
+        if (r) {
+          const scale = 0.35;
+          const dw = r.w * scale, dh = r.h * scale;
+          const dx = r.x + (r.w - dw) / 2, dy = r.y + (r.h - dh) / 2;
+          ctx.imageSmoothingEnabled = false;
+          ctx.clearRect(r.x, r.y, r.w, r.h);
+          ctx.drawImage(img, 0, 0, cw, img.height, dx, dy, dw, dh);
+        }
       }
       if (got('shield')) {
         const img = got('shield');

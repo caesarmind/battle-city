@@ -3914,20 +3914,23 @@
       };
     }
     if (BC.hasTouch()) {
-      // phone/tablet landscape: field centered, thumb zones in the side
-      // gutters - D-pad left, fire right, HUD split across both gutters
+      // phone/tablet landscape: the canvas width matches the screen's aspect
+      // ratio so nothing letterboxes - field centered, D-pad hugging the left
+      // edge, fire hugging the right, HUD split across the gutters
+      const aspect = window.innerWidth / Math.max(1, window.innerHeight);
+      const gameW = Math.min(560, Math.max(400, Math.round(240 * aspect / 2) * 2));
       return {
         mode: 'landscape-touch',
-        gameW: 400,
+        gameW: gameW,
         gameH: 240,
-        fieldOx: 96,
+        fieldOx: Math.round((gameW - 208) / 2),
         fieldOy: 16,
         touch: {
-          dpad: { x: 48, y: 168, r: 44 },
-          fire: { x: 352, y: 172, r: 30 },
+          dpad: { x: 52, y: 168, r: 44 },
+          fire: { x: gameW - 52, y: 172, r: 30 },
         },
         // right gutter, above the fire button and outside its touch radius
-        pause: { x: 352, y: 112, w: 44, h: 16 },
+        pause: { x: gameW - 52, y: 112, w: 44, h: 16 },
       };
     }
     // desktop landscape: classic NES sidebar

@@ -131,7 +131,7 @@
 
   // Build version, exchanged in the online handshake: both players must run
   // the same build so locally-constructed stages match the host's simulation.
-  BC.VERSION = '5.13';
+  BC.VERSION = '5.14';
 
   // Live per-run state (reset by GameScene on new game)
   BC.session = null;
@@ -5395,6 +5395,13 @@
       this.rowTexts = [];
       this.cursor = this.add.image(0, 0, 'atlas', 'tank_p0_0').setAngle(90);
 
+      // stage count + hard/normal for whichever row the cursor is on right
+      // now, so the player can compare before confirming with ENTER
+      const rowsPerCol = this.cols === 1 ? 14 : 7;
+      const infoY = this.topY + (rowsPerCol - 1) * this.rowGap + 16;
+      this.stagesText = BC.mkText(this, cx, infoY, '', 7, '#c0c0c0').setOrigin(0.5);
+      this.modeText = BC.mkText(this, cx, infoY + 10, '', 7, '#c0c0c0').setOrigin(0.5);
+
       this.selectText = BC.mkText(this, cx, H - 46, '', 10, '#e8a000').setOrigin(0.5);
       BC.mkText(this, cx, H - 30, 'SELECT CHANGES RULES', 6, '#707070').setOrigin(0.5);
       BC.mkText(this, cx, H - 20, 'ENTER TO CONFIRM', 6, '#707070').setOrigin(0.5);
@@ -5448,6 +5455,15 @@
       const p = this.posOf(this.sel);
       this.cursor.setPosition(p.x - 46, p.y);
       this.selectText.setText(BC.romrules.v8e ? '15-28' : '01-14');
+
+      // STAGE_SETS is indexed by the low nibble of $46, which repeats 0-6
+      // across both halves (A-G then H-N) - see BC.romrules.stageSet()
+      const set = BC.romrules.STAGE_SETS[this.sel % 7];
+      const last = set.first + set.count - 1;
+      this.stagesText.setText(set.count === 36
+        ? (set.count + ' STAGES: 1-36 FULL RUN')
+        : (set.count + ' STAGES: ' + set.first + '-' + last + ' LOOPS'));
+      this.modeText.setText(this.sel >= 7 ? 'HARD MODE' : 'NORMAL MODE');
     }
 
     toggleSelect() {
@@ -6070,10 +6086,10 @@
       title: 'ENEMY TANKS',
       subtitle: enemyBulletSummary,
       rows: [
-        { cycle: ['tank_e0_n_0_0', 'tank_e0_n_0_1'], name: 'BASIC', desc: '100 PTS. STEADY' },
-        { cycle: ['tank_e1_n_0_0', 'tank_e1_n_0_1'], name: 'FAST', desc: '200 PTS. VERY QUICK' },
-        { cycle: ['tank_e2_n_0_0', 'tank_e2_n_0_1'], name: 'POWER', desc: '300 PTS. FAST BULLETS' },
-        { cycle: ['tank_e3_h4_0_0', 'tank_e3_h4_0_1'], name: 'MASSIVE', desc: '400 PTS. 4HP TWIN GUN' },
+        { cycle: ['tank_e0_n_0_0', 'tank_e0_n_0_1'], name: 'BASIC', desc: '100 PTS. STEADY', enemyType: 0 },
+        { cycle: ['tank_e1_n_0_0', 'tank_e1_n_0_1'], name: 'FAST', desc: '200 PTS. VERY QUICK', enemyType: 1 },
+        { cycle: ['tank_e2_n_0_0', 'tank_e2_n_0_1'], name: 'POWER', desc: '300 PTS. FAST BULLETS', enemyType: 2 },
+        { cycle: ['tank_e3_h4_0_0', 'tank_e3_h4_0_1'], name: 'MASSIVE', desc: '400 PTS. 4HP TWIN GUN', enemyType: 3 },
         {
           // the game flickers a palette PAIR per remaining HP (see enemy.js
           // palettePair): 4hp green/silver, 3hp gold/silver, 2hp gold/green,
@@ -6105,7 +6121,7 @@
       subtitle: 'THIS CART ONLY',
       rows: [
         { cycle: ['pw6'], name: 'TRIPLE STAR', desc: 'MAX TIER INSTANTLY' },
-        { cycle: ['pw7'], name: 'REVIVE', desc: reviveDesc },
+        { cycle: ['pw7'], name: 'REVIVE', desc: reviveDesc, dim: () => !BC.romrules.v8e },
       ],
     },
     {
@@ -6190,9 +6206,14 @@
         const spr = add(this.add.sprite(spriteX, y + (portrait ? 14 : 9), row.tex || 'atlas', row.cycle[0])
           .setScale(scale));
         this.animated.push({ sprite: spr, cycle: row.cycle });
-        const name = add(BC.mkText(this, textX, y, row.name, 8, '#ffffff'));
+        const isDim = typeof row.dim === 'function' ? row.dim() : !!row.dim;
+        // fast bullets are a per-variant fact, not a fixed trait of the type
+        // (see BC.romrules.enemyBulletFast) - flag it right on the name
+        const isHot = row.enemyType !== undefined && BC.romrules.enemyBulletFast(row.enemyType);
+        const nameColor = isDim ? '#505050' : isHot ? '#f8a030' : '#ffffff';
+        const name = add(BC.mkText(this, textX, y, row.name, 8, nameColor));
         const desc = typeof row.desc === 'function' ? row.desc() : row.desc;
-        add(BC.mkText(this, textX, y + (portrait ? 14 : 11), desc, 8, '#909090'));
+        add(BC.mkText(this, textX, y + (portrait ? 14 : 11), desc, 8, isDim ? '#454545' : '#909090'));
         if (row.swatches) {
           const sx0 = textX + name.width + 10;
           const sy = y + (portrait ? 4 : 2); // keep clear of the desc line in tight rows

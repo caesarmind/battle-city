@@ -95,7 +95,13 @@
 
   BC.ENEMY = { BASIC: 0, FAST: 1, POWER: 2, ARMOR: 3 };
   BC.ENEMY_SCORE = [100, 200, 300, 400];
-  BC.POWERUP = { HELMET: 0, CLOCK: 1, SHOVEL: 2, STAR: 3, GRENADE: 4, TANK: 5 };
+  // Eight ids, dispatched through tbl_E9E2 ($E9E2). Ids 6 and 7 are specific
+  // to this cart: a triple star that jumps straight to max tier, and a
+  // one-shot revive that absorbs the next fatal hit.
+  BC.POWERUP = {
+    HELMET: 0, CLOCK: 1, SHOVEL: 2, STAR: 3,
+    GRENADE: 4, TANK: 5, TRIPLE_STAR: 6, REVIVE: 7,
+  };
   BC.POWERUP_SCORE = 500;
   BC.EXTRA_LIFE_SCORE = 20000;
 
@@ -103,20 +109,13 @@
   // frames that pass its parity gate (sub_DBF1_tank_movement); speed is
   // entirely how often that gate opens.
   BC.PLAYER_SPEED = 45;      // 0.75 px/frame, all tiers (upgrades never change speed)
-  // Bullets use the same gate mechanism (sub_E604_bullets_movement) and are
-  // ROM-exact at 30/60, but that makes the base tier's bullet the same speed
-  // as an idle enemy tank - slower than the player firing it. Deliberate
-  // deviation (like the massive tank's twin gun): scaled up from the ROM
-  // value so it still reads as a shot, not a NES-purity target.
-  // Calibrated against a user-measured field crossing: the real ROM's default
-  // (tier-1) bullet takes 1.83s bottom-to-top; the prior 60/120 pair measured
-  // 1.65s for the same trip - 9.8% too fast - so both are scaled by 1.65/1.83
-  // (108.2/120 = 0.9016) to land on the real timing. Halve both to go ROM-exact.
-  BC.BULLET_SPEED = 54.1;      // slow bullet
-  BC.BULLET_SPEED_FAST = 108.2; // fast bullet
-  // Star tiers per the original: 0 slow shot, 1+ fast shot, 2+ two bullets,
-  // 3 breaks steel. Tank 1990: the player spawns with one star.
-  BC.PLAYER_BULLET_SPEED = [54.1, 108.2, 108.2, 108.2];
+  // Bullets step 2 px per frame, or 4 when the fast flag is set ($E063:
+  // LDA tbl_E46C,Y / ASL / ADC $B8,X, called twice when $D6,X & 1).
+  BC.BULLET_SPEED = 120;       // 2 px/frame
+  BC.BULLET_SPEED_FAST = 240;  // 4 px/frame
+  // Star tiers: 0 slow shot, 1+ fast shot, 2+ two bullets, 3 breaks steel.
+  BC.PLAYER_BULLET_SPEED = [120, 240, 240, 240];
+  // Players only start with a star in the hard variants (sub_E3C9).
   BC.PLAYER_START_TIER = 1;
 
   // Spawn positions in subtile coords (top-left corner of the 2x2 tank cell)
@@ -132,7 +131,7 @@
 
   // Build version, exchanged in the online handshake: both players must run
   // the same build so locally-constructed stages match the host's simulation.
-  BC.VERSION = '5.12';
+  BC.VERSION = '5.13';
 
   // Live per-run state (reset by GameScene on new game)
   BC.session = null;
@@ -148,7 +147,8 @@
     const n = playerCount === 2 ? 2 : 1;
     const players = [];
     for (let i = 0; i < n; i++) {
-      players.push({ lives: 3, tier: BC.PLAYER_START_TIER, extraLifeGiven: false });
+      const tier = BC.romrules ? BC.romrules.playerStartTier() : BC.PLAYER_START_TIER;
+      players.push({ lives: 3, tier: tier, extraLifeGiven: false });
     }
     BC.session = {
       stage: stage,
@@ -1127,6 +1127,36 @@
         '..........',
       ],
     },
+    { // 6 triple star: three gold blocks, jumps straight to max tier
+      pal: { Y: '#f8b800' },
+      art: [
+        '..........',
+        '..........',
+        '.YY.YY.YY.',
+        '.YY.YY.YY.',
+        '.YY.YY.YY.',
+        '..........',
+        '..........',
+        '..........',
+        '..........',
+        '..........',
+      ],
+    },
+    { // 7 revive: heart, absorbs the next fatal hit
+      pal: { R: '#e04868' },
+      art: [
+        '..........',
+        '..RR..RR..',
+        '.RRRRRRRR.',
+        '.RRRRRRRR.',
+        '.RRRRRRRR.',
+        '..RRRRRR..',
+        '...RRRR...',
+        '....RR....',
+        '..........',
+        '..........',
+      ],
+    },
   ];
 
   const ICON_ENEMY = [
@@ -2079,6 +2109,164 @@
   };
 })();
 
+// ==== src/data/romrules.js ====
+// The cartridge's own rule tables and mode flags.
+//
+// This cart is a Tank 1990 hack, not stock Battle City, and several rules it
+// uses are NOT in the stock disassembly. Everything here is transcribed from
+// this ROM's code with the address it came from, so it can be re-checked
+// against rom-extract/super-tank-1990-1/prg.asm.
+//
+// Two globals drive the variant rules:
+//   $46  the TANK A..N selection. Low nibble ($00-$06) picks the stage set via
+//        the dispatch table at $E42B; bit 7 is a separate hard-mode flag.
+//        A-G = $00-$06, H-N = $80-$86.
+//   $8E  the SELECT toggle on the variant screen, shown as "01]14" / "15]28".
+//        Non-zero swaps the power-up table and enables the steel-break counter.
+(function () {
+  // ---- tables, verbatim from the ROM
+
+  // tbl_C59D ($C59D): enemy spawn cooldown in frames, picked at stage start
+  const SPAWN_FRAMES = [3, 8, 13, 18, 23, 28, 33, 38, 43, 48, 53, 58];
+
+  // tbl_C5A9 ($C5A9): the four tank-type tile bases. Type index = (base>>5)-4.
+  const TYPE_BASES = [0x80, 0xA0, 0xC0, 0xE0];
+
+  // tbl_C5AD ($C5AD): extra hit points rolled per spawn
+  const ARMOR_TBL = [2, 0, 1, 0, 1, 0, 1, 0];
+
+  // tbl_C5BF ($C5BF): bit 2 set means the spawn carries a power-up
+  const FLASH_TBL = [4, 4, 0, 0, 0, 0, 0, 0];
+
+  // power-up id tables. tbl_C63A ($C63A) doubles the star and drops id 7;
+  // tbl_E8FA ($E8FA) is all eight, uniform.
+  const PW_TBL_A = [0, 1, 2, 3, 3, 4, 5, 6];
+  const PW_TBL_B = [0, 1, 2, 3, 4, 5, 6, 7];
+
+  // $E42B dispatch: {stage set index, count}. Slots 3/4/5 repeat 0/1/2.
+  const STAGE_SETS = [
+    { first: 1, count: 12 },   // 0  TANK A / H
+    { first: 13, count: 12 },  // 1  TANK B / I
+    { first: 25, count: 12 },  // 2  TANK C / J
+    { first: 1, count: 12 },   // 3  TANK D / K  (duplicate of 0)
+    { first: 13, count: 12 },  // 4  TANK E / L  (duplicate of 1)
+    { first: 25, count: 12 },  // 5  TANK F / M  (duplicate of 2)
+    { first: 1, count: 36 },   // 6  TANK G / N  - the whole run
+  ];
+
+  const NAMES = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N'];
+
+  // The stage number at which several thresholds flip ($C393, $E514, $E52F)
+  const HARD_STAGE = 12;
+
+  BC.romrules = {
+    SPAWN_FRAMES: SPAWN_FRAMES,
+    TYPE_BASES: TYPE_BASES,
+    STAGE_SETS: STAGE_SETS,
+    NAMES: NAMES,
+    HARD_STAGE: HARD_STAGE,
+
+    // live mode state
+    v46: 0x86,   // default TANK N: the full 36-stage run with hard rules
+    v8e: 1,      // SELECT default ($C4EA inits it to 1)
+
+    // variant index 0..13 <-> $46
+    variantIndex() {
+      return (this.v46 & 0x80) ? 7 + (this.v46 & 0x0F) : (this.v46 & 0x0F);
+    },
+    setVariant(i) {
+      const n = ((i % 14) + 14) % 14;
+      this.v46 = n < 7 ? n : 0x80 | (n - 7);
+      return this.v46;
+    },
+    variantName() {
+      return 'TANK ' + NAMES[this.variantIndex()];
+    },
+    hard() {
+      return (this.v46 & 0x80) !== 0;
+    },
+
+    // ---- stage set
+
+    stageSet() {
+      return STAGE_SETS[this.v46 & 0x0F] || STAGE_SETS[6];
+    },
+
+    // $EFA4-$EFCD: the raw stage counter reduces modulo the set count, so a
+    // 12-stage variant loops after 12.
+    layoutFor(stageN) {
+      const set = this.stageSet();
+      const i = ((stageN - 1) % set.count + set.count) % set.count;
+      return set.first + i;
+    },
+
+    // ---- spawning ($C391-$C3B4)
+
+    // From stage 12 on the cooldown is zero: a replacement materialises on the
+    // first frame a slot frees.
+    spawnFrames(stageN, rand) {
+      if (stageN >= HARD_STAGE) return 0;
+      const span = HARD_STAGE - stageN;
+      return SPAWN_FRAMES[Math.floor(rand() * span) % span];
+    },
+
+    // $E505-$E511: type is a uniform 1-in-4 roll, per spawn, every stage.
+    rollType(rand) {
+      return Math.floor(rand() * 4) & 3;
+    },
+
+    // $E512-$E52C: 25% below stage 12, 50% from 12 on.
+    rollFlashing(stageN, rand) {
+      const mask = stageN >= HARD_STAGE ? 3 : 7;
+      const i = Math.floor(rand() * (mask + 1)) & mask;
+      return (FLASH_TBL[i] & 4) !== 0;
+    },
+
+    // $E52D-$E547: extra hit points, 0..2. Half of all spawns carry some,
+    // at every stage including stage 1.
+    rollArmor(stageN, rand) {
+      const mask = stageN >= HARD_STAGE ? 7 : 3;
+      const i = Math.floor(rand() * (mask + 1)) & mask;
+      return ARMOR_TBL[i] & 3;
+    },
+
+    // ---- variant-dependent rules
+
+    // $E55B: $49 = 7 in hard variants (enemies pick items up too), else 1.
+    enemiesTakeItems() {
+      return this.hard();
+    },
+
+    // sub_E3C9: players only start with a star in the hard variants.
+    playerStartTier() {
+      return this.hard() ? 1 : 0;
+    },
+
+    // loc_FFC1 vs loc_E0C0: hard variants give every type above basic a fast
+    // bullet; otherwise only the power tank fires fast.
+    enemyBulletFast(type) {
+      return this.hard() ? type >= 1 : type === 2;
+    },
+
+    // $E8E6-$E8EF via sub_C5F3
+    rollPowerup(rand) {
+      const tbl = this.v8e ? PW_TBL_B : PW_TBL_A;
+      return tbl[Math.floor(rand() * 8) & 7];
+    },
+
+    // $C603/$C617: the steel-break counter only advances when SELECT is on,
+    // so with $8E == 0 steel can never be broken.
+    steelBreakEnabled() {
+      return this.v8e !== 0;
+    },
+
+    reset() {
+      this.v46 = 0x86;
+      this.v8e = 1;
+    },
+  };
+})();
+
 // ==== src/data/levels.js ====
 // Authored stage maps: 13 strings x 13 chars, one char per 16px tile.
 //   .  empty      #  brick       @  steel      ~  water     %  trees    -  ice
@@ -2813,9 +3001,9 @@
       basic = 0;
     }
 
-    // NES spawn interval: 190 - 4*stage frames (stage clamped at 35);
-    // 2-player mode subtracts another 20 frames (applied in GameScene)
-    const spawnFrames = Math.max(50, 190 - 4 * Math.min(n, 35));
+    // $C391-$C3B4: rolled ONCE per stage from tbl_C59D, and identically zero
+    // from stage 12 on - a freed slot refills on the very next frame.
+    const spawnFrames = BC.romrules.spawnFrames(stageN, Math.random);
 
     return {
       roster: [basic, fast, power, armor],
@@ -2827,10 +3015,6 @@
       maxConcurrent: 4,          // 4 in 1P; GameScene raises to 6 in 2P (NES-exact)
       spawnDelayMs: Math.round(spawnFrames * 1000 / 60),
       spawnFrames: spawnFrames,  // the AI phase clock derives from this (see enemy.js)
-      // Armor modifier (Tank 1990: any tank type may be armored): from stage 4,
-      // chance and max layers grow with the stage
-      armorChance: n < 4 ? 0 : Math.min(0.4, 0.08 + (n - 4) * 0.004),
-      armorMaxLayers: 1 + (n >= 25 ? 1 : 0) + (n >= 60 ? 1 : 0),
       // Fixed NES timer durations (10/20 ticks of 64 frames)
       freezeMs: 10600,
       shovelMs: 21300,
@@ -3603,11 +3787,17 @@
   // this build (the --local build ships the 35 originals in BC.bundledStages),
   // then our authored map, then the generator.
   BC.getStage = function (n) {
-    const custom = BC.customStages && BC.customStages[n];
+    // a map built in CONSTRUCTION wins while it exists (RAM only)
+    if (BC.constructed) return { map: BC.constructed, roster: rosterFor(n) };
+    // $EFA4-$EFCD reduces the stage number modulo the variant's set size to
+    // pick the LAYOUT, while difficulty keeps reading the raw stage number.
+    // A 12-stage variant therefore loops its maps but keeps getting harder.
+    const li = BC.romrules.layoutFor(n);
+    const custom = BC.customStages && BC.customStages[li];
     if (custom) return { map: custom, roster: rosterFor(n) };
-    const bundled = BC.bundledStages && BC.bundledStages[n];
+    const bundled = BC.bundledStages && BC.bundledStages[li];
     if (bundled) return { map: bundled, roster: rosterFor(n) };
-    if (BC.levels.has(n)) return { map: BC.levels.getMap(n), roster: rosterFor(n) };
+    if (BC.levels.has(li)) return { map: BC.levels.getMap(li), roster: rosterFor(n) };
     return { map: BC.generator.generate(n), roster: rosterFor(n) };
   };
 
@@ -3956,10 +4146,16 @@
     // returns true if the hit killed the player
     hit() {
       if (!this.alive || this.isShielded()) return false;
+      // loc_FF66: a one-shot revive ($0170,X) is spent instead of the kill
+      if (this.revive) {
+        this.revive = false;
+        BC.sfx.play('hit');
+        return false;
+      }
       this.alive = false;
       this.sprite.setVisible(false);
       this.shieldSprite.setVisible(false);
-      this.state.tier = BC.PLAYER_START_TIER; // Tank 1990: respawn with one star
+      this.state.tier = BC.romrules.playerStartTier(); // hard variants respawn with a star
       BC.sfx.play('playerBoom');
       this.scene.fx.bigBoom(this.x, this.y);
       this.scene.onPlayerDeath(this);
@@ -3981,11 +4177,14 @@
 // palette flickers by remaining HP like the original armor tank) and flashing
 // (bonus: absorbs the first hit and drops an item).
 (function () {
+  // No type carries special hit points. $A8,X & $03 is rolled per spawn and is
+  // the only source of extra hits, so the armour tank ($E0) is a 1-hit tank
+  // like the rest; the familiar 4-hit tank is the single case handled below.
   const TYPES = [
-    { speed: 30, hp: 1, bulletFast: false, bullets: 1 }, // basic  (0.5 px/frame)
-    { speed: 60, hp: 1, bulletFast: false, bullets: 1 }, // fast   (1.0 px/frame)
-    { speed: 30, hp: 1, bulletFast: true, bullets: 1 },  // power  (0.5, fast shot)
-    { speed: 30, hp: 4, bulletFast: false, bullets: 2 }, // massive (0.5, twin gun)
+    { speed: 30, bullets: 1 }, // basic  (0.5 px/frame)
+    { speed: 60, bullets: 1 }, // fast   (1.0 px/frame)
+    { speed: 30, bullets: 1 }, // power  (0.5 px/frame)
+    { speed: 30, bullets: 1 }, // armour (0.5 px/frame)
   ];
   // palette pairs flickered per frame by remaining HP (original armor tank)
   function palettePair(hp) {
@@ -4003,7 +4202,9 @@
         isPlayer: false,
       });
       this.type = type;
-      this.hp = TYPES[type].hp + (armorLayers || 0);
+      // $E7DA-$E7E1: a bonus armour tank that rolled no armour ($A8,X == $E4)
+      // decrements to $E3 on the item-revealing hit, so it takes 4 in total.
+      this.hp = (type === 3 && flashing && !armorLayers) ? 4 : 1 + (armorLayers || 0);
       this.flashing = flashing;
       this.cfg = cfg;
       this.index = index || 0;
@@ -4012,7 +4213,8 @@
       this.aiDir = BC.DIR.DOWN;
       this.moveAcc = 0;       // px since last grid-alignment decision point
       this.pauseUntil = 0;    // wall-grind pause (ms of playTime)
-      this.bulletSpeed = TYPES[type].bulletFast ? BC.BULLET_SPEED_FAST : BC.BULLET_SPEED;
+      this.bulletSpeed = BC.romrules.enemyBulletFast(type)
+        ? BC.BULLET_SPEED_FAST : BC.BULLET_SPEED;
       this.bulletLimit = TYPES[type].bullets;
     }
 
@@ -4170,14 +4372,16 @@
       this.spawnedCount = 0;
       this.pendingFlickers = 0;
       this.flashingSet = scene.testMode ? FLASHING_TEST : FLASHING;
+      this.total = 20;
 
-      // NES order: the whole first group spawns, then the next, and so on
-      // (roster arrives as ordered [type, count] groups from BC.getStage)
-      this.queue = BC.waves.queue(roster);
+      // This cart has NO per-stage roster table: sub_E4EC rolls the type,
+      // the bonus flag and the armour independently for every single spawn.
+      // The queue survives only for the test range, which wants determinism.
+      this.queue = scene.testMode ? BC.waves.queue(roster) : null;
     }
 
     remaining() {
-      return this.queue.length - this.spawnedCount;
+      return this.total - this.spawnedCount;
     }
 
     activeCount() {
@@ -4187,14 +4391,14 @@
     }
 
     cleared() {
-      return this.spawnedCount >= this.queue.length && this.activeCount() === 0 &&
+      return this.spawnedCount >= this.total && this.activeCount() === 0 &&
         this.pendingFlickers === 0;
     }
 
     update(dt) {
       this.timer -= dt * 1000;
       if (this.timer > 0) return;
-      if (this.spawnedCount >= this.queue.length) return;
+      if (this.spawnedCount >= this.total) return;
       if (this.activeCount() + this.pendingFlickers >= this.cfg.maxConcurrent) {
         this.timer = 100; // NES retries every frame once a slot frees
         return;
@@ -4211,17 +4415,24 @@
       this.timer = this.cfg.spawnDelayMs;
       // armor modifier: any tier can spawn with extra hit layers (stage-gated);
       // the test range guarantees a steady supply for inspection
+      const stageN = this.scene.stageN || 1;
       let armor = 0;
+      let flashing;
+      let type;
       if (this.scene.testMode) {
         if (idx % 4 === 3) armor = 1 + (idx % 8 === 7 ? 1 : 0);
-      } else if (Math.random() < this.cfg.armorChance) {
-        armor = 1 + Math.floor(Math.random() * this.cfg.armorMaxLayers);
+        flashing = this.flashingSet.indexOf(idx) !== -1;
+        type = this.queue[idx];
+      } else {
+        // three independent rolls per spawn, exactly as $E505-$E547 does
+        type = BC.romrules.rollType(Math.random);
+        flashing = BC.romrules.rollFlashing(stageN, Math.random);
+        armor = BC.romrules.rollArmor(stageN, Math.random);
       }
-      const flashing = this.flashingSet.indexOf(idx) !== -1;
       // ROM hides any uncollected item the moment a bonus spawn is committed,
       // not when the tank finally materializes
       if (flashing) this.scene.powerups.removeExisting();
-      this._flickerThenSpawn(chosen.cx, chosen.cy, this.queue[idx], flashing, armor, idx);
+      this._flickerThenSpawn(chosen.cx, chosen.cy, type, flashing, armor, idx);
       this.scene.events.emit('hud');
     }
 
@@ -4393,23 +4604,9 @@
             return true;
           }
         }
-        // friendly fire (original rule, per the NES disassembly): ~4.4s stun
-        // that blocks movement but not firing; hitting an already-stunned
-        // player does NOT reload the timer; a shielded player ignores it
-        for (const p of scene.players) {
-          if (!p || !p.alive || p === b.owner) continue;
-          if (overlapsTank(b, p)) {
-            // ROM: a shielded absorb removes the bullet silently; a landed hit
-            // explodes
-            if (p.isShielded()) {
-              scene.bullets.kill(b, false);
-            } else {
-              scene.bullets.kill(b, true);
-              if (scene.playTime >= p.stunnedUntil) p.stun(4400);
-            }
-            return true;
-          }
-        }
+        // No friendly fire: sub_E782 pairs player bullets against enemy slots
+        // only, and sub_E70C pairs players against enemy bullets. The cart
+        // never tests a player bullet against a player.
       } else {
         for (const p of scene.players) {
           if (!p || !p.alive) continue;
@@ -4476,10 +4673,10 @@
 
     spawn(forcedType) {
       this.removeExisting();
-      // ROM weights (tbl_E8FA): star and grenade appear twice in the 8-entry
-      // table, so they are 2/8 each and the rest 1/8
-      const TBL = [0, 1, 2, 3, 4, 5, 4, 3];
-      const type = forcedType !== undefined ? forcedType : TBL[Math.floor(Math.random() * 8)];
+      // $E8E6 rolls rand&7 through sub_C5F3, which picks tbl_E8FA (all eight
+      // ids, uniform) or tbl_C63A (star doubled, no id 7) depending on $8E.
+      const type = forcedType !== undefined
+        ? forcedType : BC.romrules.rollPowerup(Math.random);
       // NES drop grid: 16 fixed spots, centres at 32/80/128/176 in field px.
       // The ROM re-rolls only when a player is already standing there (an item
       // may legitimately land on water or steel and be unreachable).
@@ -4545,6 +4742,13 @@
       } else if (type === P.TANK) {
         player.state.lives += 1;
         BC.sfx.play('life');
+      } else if (type === P.TRIPLE_STAR) {
+        // $C613: straight to the top tier rather than one star at a time
+        player.state.tier = 3;
+        player.applyTier();
+      } else if (type === P.REVIVE) {
+        // $FEA7 sets $0170,X = $FF; loc_FF66 spends it instead of killing
+        player.revive = true;
       }
       scene.events.emit('hud');
     }
@@ -5062,6 +5266,8 @@
         this.scene.start('Online', { autojoin: code });
         return;
       }
+      // $C09A: returning to the title discards anything built in CONSTRUCTION
+      BC.constructed = null;
       const W = BC.layout.gameW, H = BC.layout.gameH;
       const cx = W / 2;
       this.cameras.main.setBackgroundColor('#000000');
@@ -5070,11 +5276,15 @@
       BC.mkText(this, cx, titleY, 'BATTLE', 30, '#d84020').setOrigin(0.5);
       BC.mkText(this, cx, titleY + 32, 'CITY', 30, '#d84020').setOrigin(0.5);
       BC.mkText(this, cx, titleY + 54, 'DENDY TANK TRIBUTE', 7, '#909090').setOrigin(0.5);
+      this.variantLine = BC.mkText(this, cx, titleY + 64, '', 6, '#707070').setOrigin(0.5);
 
       const maxStage = BC.storage.getMaxStage();
       this.items = [
         { label: '1 PLAYER', action: () => this.startGame(1, 1) },
         { label: '2 PLAYERS', action: () => this.startGame(1, 2) },
+        { label: 'CONSTRUCTION', action: () => this.scene.start('Construction') },
+        { label: () => 'VARIANT ' + BC.romrules.variantName().replace('TANK ', ''),
+          action: () => this.scene.start('Variant') },
         { label: 'ONLINE', action: () => this.scene.start('Online') },
       ];
       if (maxStage > 1) {
@@ -5114,6 +5324,10 @@
     }
 
     renderItems() {
+      if (this.variantLine) {
+        const r = BC.romrules;
+        this.variantLine.setText(r.variantName() + '   ' + (r.v8e ? '15-28' : '01-14'));
+      }
       for (const t of this.itemTexts) t.destroy();
       this.itemTexts = [];
       const cx = BC.layout.gameW / 2;
@@ -5138,6 +5352,301 @@
 
     startGame(stage, playerCount) {
       this.scene.start('Game', { stage: stage, fresh: true, playerCount: playerCount || 1 });
+    }
+  };
+})();
+
+// ==== src/scenes/VariantScene.js ====
+// The cartridge's variant screen: TANK A .. TANK N.
+//
+// On the cart this is forced on cold power-on (sub_C4A1) and afterwards is
+// reachable only through a title-screen code. Here it is a normal menu entry
+// as well, because the clone has no cold/warm boot distinction to hang the
+// forced version on.
+//
+// Picking a row writes $46 (BC.romrules.v46): the low nibble selects the stage
+// set through the $E42B dispatch, and bit 7 is a separate hard-mode flag that
+// changes who may collect power-ups, whether players start with a star, and
+// which enemy types fire a fast bullet.
+//
+// SELECT toggles $8E, drawn on the cart as "01]14" / "15]28". The RetroFont has
+// no ']' so this uses '-'.
+(function () {
+  BC.VariantScene = class extends Phaser.Scene {
+    constructor() { super({ key: 'Variant' }); }
+
+    create() {
+      const W = BC.layout.gameW;
+      const H = BC.layout.gameH;
+      const cx = W / 2;
+      this.cameras.main.setBackgroundColor('#000000');
+
+      BC.mkText(this, cx, 16, 'SELECT TANK', 12, '#d84020').setOrigin(0.5);
+
+      // 14 rows have to fit the short landscape canvas, so they run in two
+      // columns of seven when the screen is not tall enough for one.
+      const tall = H >= 320;
+      this.cols = tall ? 1 : 2;
+      this.rowGap = tall ? 15 : 16;
+      this.topY = tall ? 60 : 46;
+      this.colX = tall ? [cx] : [cx - 52, cx + 52];
+
+      this.sel = BC.romrules.variantIndex();
+      this.rowTexts = [];
+      this.cursor = this.add.image(0, 0, 'atlas', 'tank_p0_0').setAngle(90);
+
+      this.selectText = BC.mkText(this, cx, H - 46, '', 10, '#e8a000').setOrigin(0.5);
+      BC.mkText(this, cx, H - 30, 'SELECT CHANGES RULES', 6, '#707070').setOrigin(0.5);
+      BC.mkText(this, cx, H - 20, 'ENTER TO CONFIRM', 6, '#707070').setOrigin(0.5);
+
+      this.render();
+
+      this._armed = false;
+      this.time.delayedCall(400, () => { this._armed = true; });
+      this.input.keyboard.on('keydown-UP', () => this.move(-1));
+      this.input.keyboard.on('keydown-DOWN', () => this.move(1));
+      this.input.keyboard.on('keydown-W', () => this.move(-1));
+      this.input.keyboard.on('keydown-S', () => this.move(1));
+      this.input.keyboard.on('keydown-LEFT', () => this.move(-7));
+      this.input.keyboard.on('keydown-RIGHT', () => this.move(7));
+      // SELECT toggles $8E
+      this.input.keyboard.on('keydown-SHIFT', () => this.toggleSelect());
+      this.input.keyboard.on('keydown-TAB', (e) => { e.preventDefault(); this.toggleSelect(); });
+      const go = () => {
+        if (!this._armed) return;
+        BC.romrules.setVariant(this.sel);
+        BC.sfx.play('pwGet');
+        this.scene.start('Menu');
+      };
+      this.input.keyboard.on('keydown-ENTER', go);
+      this.input.keyboard.on('keydown-SPACE', go);
+      this.input.keyboard.on('keydown-ESC', () => this.scene.start('Menu'));
+    }
+
+    posOf(i) {
+      const col = this.cols === 1 ? 0 : Math.floor(i / 7);
+      const row = this.cols === 1 ? i : i % 7;
+      return { x: this.colX[col], y: this.topY + row * this.rowGap };
+    }
+
+    render() {
+      for (const t of this.rowTexts) t.destroy();
+      this.rowTexts = [];
+      BC.romrules.NAMES.forEach((name, i) => {
+        const p = this.posOf(i);
+        const t = BC.mkText(this, p.x, p.y, 'TANK ' + name, 10, i === this.sel ? '#ffffff' : '#909090')
+          .setOrigin(0.5).setInteractive({ useHandCursor: true });
+        t.on('pointerdown', () => {
+          if (this.sel === i) {
+            BC.romrules.setVariant(i);
+            BC.sfx.play('pwGet');
+            this.scene.start('Menu');
+          } else { this.sel = i; this.render(); }
+        });
+        this.rowTexts.push(t);
+      });
+      const p = this.posOf(this.sel);
+      this.cursor.setPosition(p.x - 46, p.y);
+      this.selectText.setText(BC.romrules.v8e ? '15-28' : '01-14');
+    }
+
+    toggleSelect() {
+      BC.romrules.v8e = BC.romrules.v8e ? 0 : 1;
+      BC.sfx.play('tick');
+      this.render();
+    }
+
+    move(d) {
+      this.sel = (this.sel + d + 14) % 14;
+      BC.sfx.play('tick');
+      this.render();
+    }
+  };
+})();
+
+// ==== src/scenes/ConstructionScene.js ====
+// CONSTRUCTION - the cartridge's built-in stage editor.
+//
+// Faithful to the cart, including the part people find surprising: there is no
+// persistence. The cart has no battery (manifest header.battery = false), the
+// map lives in field RAM, and it is discarded when the title screen resets.
+// So the map here lives on BC.constructed, a plain in-memory value that
+// MenuScene clears on every visit to the title. Reloading loses it.
+//
+// Behaviour transcribed from $C0AE (setup), $C6D2 (cursor movement) and
+// $C8D0 (clamping):
+//  - the field is cleared, then the eagle and its brick ring are stamped
+//  - a 16x16 cursor moves over a 13x13 grid of blocks, clamped to the field
+//  - a held direction repeats after a 20-frame delay, then every 5 frames
+//  - fire cycles the block under the cursor
+(function () {
+  const G = BC.GRID;               // 26 subtiles
+  const BLOCKS = 13;               // 13x13 blocks of 16px
+  const T = BC.T;
+
+  // the cycle the cart steps through, then back to empty
+  const CYCLE = [T.BRICK, T.STEEL, T.TREES, T.WATER, T.ICE, T.EMPTY];
+  const CHAR = {};
+  CHAR[T.EMPTY] = '.'; CHAR[T.BRICK] = '#'; CHAR[T.STEEL] = '@';
+  CHAR[T.TREES] = '%'; CHAR[T.WATER] = '~'; CHAR[T.ICE] = '-';
+
+  const REPEAT_DELAY = 20 / 60 * 1000;   // 20 frames
+  const REPEAT_RATE = 5 / 60 * 1000;     // then every 5 frames
+
+  BC.ConstructionScene = class extends Phaser.Scene {
+    constructor() { super({ key: 'Construction' }); }
+
+    create() {
+      const L = BC.layout;
+      this.cameras.main.setBackgroundColor('#000000');
+      this.fieldOx = L.fieldOx;
+      this.fieldOy = L.fieldOy;
+
+      // 13x13 block grid, all empty to start
+      this.blocks = [];
+      for (let r = 0; r < BLOCKS; r++) this.blocks.push(new Array(BLOCKS).fill(T.EMPTY));
+
+      this.terrain = new BC.Terrain(this, this.fieldOx, this.fieldOy);
+      this.redrawAll();
+      this.stampBase();
+
+      this.cx = 0;
+      this.cy = 0;
+      this.cursor = this.add.rectangle(0, 0, 16, 16)
+        .setStrokeStyle(2, 0xffffff).setDepth(BC.DEPTH.POPUP);
+      this.blink = 0;
+      this.placeCursor();
+
+      BC.mkText(this, L.gameW / 2, 4, 'CONSTRUCTION', 8, '#d84020').setOrigin(0.5, 0);
+      const hintY = this.fieldOy + 208 + 6;
+      BC.mkText(this, L.gameW / 2, hintY, 'FIRE CYCLES BLOCK', 6, '#808080').setOrigin(0.5, 0);
+      BC.mkText(this, L.gameW / 2, hintY + 9, 'ENTER PLAYS.  ESC EXITS', 6, '#808080').setOrigin(0.5, 0);
+      BC.mkText(this, L.gameW / 2, hintY + 18, 'NOT SAVED', 6, '#606060').setOrigin(0.5, 0);
+
+      this.held = null;
+      this.heldSince = 0;
+      this.nextRepeat = 0;
+      this.t = 0;
+
+      const K = Phaser.Input.Keyboard.KeyCodes;
+      this.keys = this.input.keyboard.addKeys({
+        up: K.UP, down: K.DOWN, left: K.LEFT, right: K.RIGHT,
+        w: K.W, a: K.A, s: K.S, d: K.D,
+      });
+      this.input.keyboard.on('keydown-SPACE', () => this.cycle());
+      this.input.keyboard.on('keydown-ENTER', () => this.play());
+      this.input.keyboard.on('keydown-ESC', () => this.scene.start('Menu'));
+
+      // touch: tap a block to cycle it
+      this.input.on('pointerdown', (p) => {
+        const bx = Math.floor((p.x - this.fieldOx) / 16);
+        const by = Math.floor((p.y - this.fieldOy) / 16);
+        if (bx < 0 || by < 0 || bx >= BLOCKS || by >= BLOCKS) return;
+        this.cx = bx; this.cy = by;
+        this.placeCursor();
+        this.cycle();
+      });
+    }
+
+    // the eagle and its brick ring are drawn by the editor, not editable
+    stampBase() {
+      const t = this.terrain;
+      for (const [sx, sy] of t.shellCells) t.set(sx, sy, T.BRICK);
+      const e = BC.EAGLE;
+      for (let dy = 0; dy < 2; dy++) {
+        for (let dx = 0; dx < 2; dx++) t.set(e.sx + dx, e.sy + dy, T.EAGLE);
+      }
+    }
+
+    blockEditable(bx, by) {
+      // the base pocket belongs to the eagle
+      return !(by >= 11 && bx >= 5 && bx <= 7);
+    }
+
+    redrawBlock(bx, by) {
+      const v = this.blocks[by][bx];
+      for (let dy = 0; dy < 2; dy++) {
+        for (let dx = 0; dx < 2; dx++) this.terrain.set(bx * 2 + dx, by * 2 + dy, v);
+      }
+    }
+
+    redrawAll() {
+      for (let by = 0; by < BLOCKS; by++) for (let bx = 0; bx < BLOCKS; bx++) this.redrawBlock(bx, by);
+    }
+
+    placeCursor() {
+      this.cursor.setPosition(
+        this.fieldOx + this.cx * 16 + 8,
+        this.fieldOy + this.cy * 16 + 8,
+      );
+    }
+
+    cycle() {
+      if (!this.blockEditable(this.cx, this.cy)) { BC.sfx.play('steel'); return; }
+      const cur = this.blocks[this.cy][this.cx];
+      const i = CYCLE.indexOf(cur);
+      this.blocks[this.cy][this.cx] = CYCLE[(i + 1) % CYCLE.length];
+      this.redrawBlock(this.cx, this.cy);
+      BC.sfx.play('tick');
+    }
+
+    step(dx, dy) {
+      // $C8D0 clamps to the field rather than wrapping
+      this.cx = Math.max(0, Math.min(BLOCKS - 1, this.cx + dx));
+      this.cy = Math.max(0, Math.min(BLOCKS - 1, this.cy + dy));
+      this.placeCursor();
+    }
+
+    dirHeld() {
+      const k = this.keys;
+      if (k.up.isDown || k.w.isDown) return [0, -1];
+      if (k.down.isDown || k.s.isDown) return [0, 1];
+      if (k.left.isDown || k.a.isDown) return [-1, 0];
+      if (k.right.isDown || k.d.isDown) return [1, 0];
+      return null;
+    }
+
+    update(time, delta) {
+      this.t += delta;
+      this.blink += delta;
+      this.cursor.setVisible(Math.floor(this.blink / 133) % 2 === 0);
+
+      const d = this.dirHeld();
+      if (!d) { this.held = null; return; }
+      const key = d[0] + ',' + d[1];
+      if (this.held !== key) {
+        this.held = key;
+        this.step(d[0], d[1]);
+        this.nextRepeat = this.t + REPEAT_DELAY;
+        return;
+      }
+      if (this.t >= this.nextRepeat) {
+        this.step(d[0], d[1]);
+        this.nextRepeat = this.t + REPEAT_RATE;
+      }
+    }
+
+    // 26x26 map text, base pocket left clear for the game to stamp
+    toMap() {
+      const rows = [];
+      for (let sy = 0; sy < G; sy++) {
+        let s = '';
+        for (let sx = 0; sx < G; sx++) {
+          const v = this.blocks[Math.floor(sy / 2)][Math.floor(sx / 2)];
+          s += CHAR[v] || '.';
+        }
+        rows.push(s);
+      }
+      for (let r = 22; r <= 25; r++) {
+        rows[r] = rows[r].slice(0, 10) + '......' + rows[r].slice(16);
+      }
+      return rows;
+    }
+
+    play() {
+      // in RAM only - MenuScene clears it, and a reload loses it
+      BC.constructed = this.toMap();
+      this.scene.start('Game', { stage: 1, fresh: true, playerCount: 1 });
     }
   };
 })();
@@ -5170,9 +5679,16 @@
     buildUI() {
       if (this.root) this.root.destroy(true);
       this.root = this.add.container(0, 0);
-      const W = BC.layout.gameW;
+      const L = BC.layout;
+      const W = L.gameW;
       const title = BC.mkText(this, W / 2, 10, 'SELECT STAGE', 12, '#d84020').setOrigin(0.5, 0);
       this.root.add(title);
+      // which cartridge variant is loaded - determines the stage set below
+      // (see BC.romrules.stageSet/layoutFor) and the difficulty rules in play
+      const gx = L.mode === 'landscape-touch' ? Math.round((W - 288) / 2) : 0;
+      const contentRight = gx + (L.mode === 'landscape-touch' ? 288 : W);
+      const variantTag = BC.romrules.variantName() + (BC.romrules.hard() ? ' HARD' : '');
+      this.root.add(BC.mkText(this, contentRight - 3, 3, variantTag, 6, '#707070').setOrigin(1, 0));
 
       const gridX = (W - COLS * 34) / 2 + 2;
       const gridY = 34;
@@ -5213,7 +5729,13 @@
         .setOrigin(0.5).setInteractive({ useHandCursor: true });
       mode.on('pointerdown', () => { this.mode2p = !this.mode2p; BC.sfx.play('tick'); this.buildUI(); });
       this.root.add(mode);
-      const hint = BC.mkText(this, W / 2, botY + 30, this.romMsg || ('STAGE ' + this.sel + ': TAP AGAIN'), 7,
+      // a variant with a shorter stage set loops: raw stage N can play an
+      // earlier authored map at harder difficulty (BC.romrules.layoutFor)
+      const li = BC.romrules.layoutFor(this.sel);
+      const defaultHint = li === this.sel
+        ? 'STAGE ' + this.sel + ': TAP AGAIN'
+        : 'STAGE ' + this.sel + ' = MAP ' + li + '. TAP AGAIN';
+      const hint = BC.mkText(this, W / 2, botY + 30, this.romMsg || defaultHint, 7,
         this.romMsg ? '#48a048' : '#808080').setOrigin(0.5);
       this.root.add(hint);
       // load stage layouts from a ROM the player owns (read locally)
@@ -5508,19 +6030,45 @@
 // modifiers, frequent item drops). Text must stay within BC.FONT_CHARS
 // (no commas, parentheses or plus signs) and descs within 21 chars.
 (function () {
+  // Player tier 0 is the real start in the normal (non-hard) variants; tier 1
+  // stays the start in the hard ones. Mark whichever one currently applies.
+  const PLAYER_TIER_DESC = ['SLOW SHOT', 'FAST SHOT', 'TWO BULLETS AT ONCE', 'BREAKS STEEL WALLS'];
+  function playerTierDesc(tier) {
+    const base = PLAYER_TIER_DESC[tier];
+    return tier === BC.romrules.playerStartTier() ? base + '. START TIER' : base;
+  }
+
+  function enemyBulletSummary() {
+    return BC.romrules.hard() ? 'ALL BUT BASIC FIRE FAST' : 'ONLY POWER FIRES FAST';
+  }
+
+  function itemsSubtitle() {
+    return BC.romrules.enemiesTakeItems() ? 'ENEMIES CAN GRAB THEM TOO' : 'ENEMIES DO NOT GRAB THEM';
+  }
+
+  function reviveDesc() {
+    return BC.romrules.v8e ? 'SAVES FROM NEXT DEATH' : 'NOT IN THIS VARIANT';
+  }
+
+  function steelDesc() {
+    return BC.romrules.steelBreakEnabled() ? 'ONLY TIER 3 BREAKS IT' : 'INDESTRUCTIBLE HERE';
+  }
+
   const PAGES = [
     {
       title: 'PLAYER TANKS',
-      subtitle: 'YOU START WITH ONE STAR',
+      subtitle: () => (BC.romrules.playerStartTier() > 0 ? 'YOU START WITH ONE STAR' : 'YOU START WEAK. NO STAR'),
       rows: [
-        { cycle: ['tank_p1_0_0', 'tank_p1_0_1'], name: '1 STAR', desc: 'FAST SHOT. START TIER' },
-        { cycle: ['tank_p2_0_0', 'tank_p2_0_1'], name: '2 STARS', desc: 'TWO BULLETS AT ONCE' },
-        { cycle: ['tank_p3_0_0', 'tank_p3_0_1'], name: '3 STARS', desc: 'BREAKS STEEL WALLS' },
+        { cycle: ['tank_p0_0_0', 'tank_p0_0_1'], name: '0 STARS', desc: () => playerTierDesc(0) },
+        { cycle: ['tank_p1_0_0', 'tank_p1_0_1'], name: '1 STAR', desc: () => playerTierDesc(1) },
+        { cycle: ['tank_p2_0_0', 'tank_p2_0_1'], name: '2 STARS', desc: () => playerTierDesc(2) },
+        { cycle: ['tank_p3_0_0', 'tank_p3_0_1'], name: '3 STARS', desc: () => playerTierDesc(3) },
         { cycle: ['tank_q1_0_0', 'tank_q1_0_1'], name: 'PLAYER 2', desc: 'GREEN TANK IN 2P MODE' },
       ],
     },
     {
       title: 'ENEMY TANKS',
+      subtitle: enemyBulletSummary,
       rows: [
         { cycle: ['tank_e0_n_0_0', 'tank_e0_n_0_1'], name: 'BASIC', desc: '100 PTS. STEADY' },
         { cycle: ['tank_e1_n_0_0', 'tank_e1_n_0_1'], name: 'FAST', desc: '200 PTS. VERY QUICK' },
@@ -5540,7 +6088,7 @@
     },
     {
       title: 'ITEMS',
-      subtitle: 'ENEMIES CAN GRAB THEM TOO',
+      subtitle: itemsSubtitle,
       rows: [
         { cycle: ['pw0'], name: 'HELMET', desc: 'SHIELD FOR 10 SECONDS' },
         { cycle: ['pw1'], name: 'CLOCK', desc: 'FREEZES ALL ENEMIES' },
@@ -5551,10 +6099,20 @@
       ],
     },
     {
+      // this cart's own additions to the item table, id 6/7 - split onto
+      // their own page so ITEMS stays within the 6-row landscape ceiling
+      title: 'BONUS ITEMS',
+      subtitle: 'THIS CART ONLY',
+      rows: [
+        { cycle: ['pw6'], name: 'TRIPLE STAR', desc: 'MAX TIER INSTANTLY' },
+        { cycle: ['pw7'], name: 'REVIVE', desc: reviveDesc },
+      ],
+    },
+    {
       title: 'TERRAIN',
       rows: [
         { cycle: ['tile_brick'], tex: 'tiles', name: 'BRICK', desc: 'SHOOT TO DESTROY' },
-        { cycle: ['tile_steel'], tex: 'tiles', name: 'STEEL', desc: 'ONLY TIER 3 BREAKS IT' },
+        { cycle: ['tile_steel'], tex: 'tiles', name: 'STEEL', desc: steelDesc },
         { cycle: ['tile_water'], tex: 'tiles', name: 'WATER', desc: 'BLOCKS TANKS ONLY' },
         { cycle: ['tile_trees'], tex: 'tiles', name: 'TREES', desc: 'HIDES TANKS A LITTLE' },
         { cycle: ['tile_ice'], tex: 'tiles', name: 'ICE', desc: 'TANKS SLIDE ON IT' },
@@ -5609,13 +6167,21 @@
       const spriteX = (portrait ? 26 : 22) + gx;
       const textX = (portrait ? 48 : 42) + gx;
       const p = PAGES[this.page];
+      // right edge of the 288px content block in landscape-touch (where side
+      // gutters hold the D-pad/fire button), otherwise the full canvas width
+      const contentRight = gx + (L.mode === 'landscape-touch' ? 288 : W);
 
       const add = (o) => { this.root.add(o); return o; };
 
       add(BC.mkText(this, W / 2, portrait ? 12 : 8, p.title, 10, '#d84020').setOrigin(0.5, 0));
       if (p.subtitle) {
-        add(BC.mkText(this, W / 2, portrait ? 26 : 20, p.subtitle, 8, '#808080').setOrigin(0.5, 0));
+        const sub = typeof p.subtitle === 'function' ? p.subtitle() : p.subtitle;
+        add(BC.mkText(this, W / 2, portrait ? 26 : 20, sub, 8, '#808080').setOrigin(0.5, 0));
       }
+      // which cartridge variant these rules apply to - the descriptions
+      // below change with it (start tier, fast-bullet types, steel, revive)
+      const variantTag = BC.romrules.variantName() + (BC.romrules.hard() ? ' HARD' : '');
+      add(BC.mkText(this, contentRight - 3, 3, variantTag, 6, '#707070').setOrigin(1, 0));
 
       p.rows.forEach((row, i) => {
         const y = top + i * rowH;
@@ -5625,7 +6191,8 @@
           .setScale(scale));
         this.animated.push({ sprite: spr, cycle: row.cycle });
         const name = add(BC.mkText(this, textX, y, row.name, 8, '#ffffff'));
-        add(BC.mkText(this, textX, y + (portrait ? 14 : 11), row.desc, 8, '#909090'));
+        const desc = typeof row.desc === 'function' ? row.desc() : row.desc;
+        add(BC.mkText(this, textX, y + (portrait ? 14 : 11), desc, 8, '#909090'));
         if (row.swatches) {
           const sx0 = textX + name.width + 10;
           const sy = y + (portrait ? 4 : 2); // keep clear of the desc line in tight rows
@@ -6096,6 +6663,8 @@
     scene: [
       BC.BootScene,
       BC.MenuScene,
+      BC.VariantScene,
+      BC.ConstructionScene,
       BC.StageSelectScene,
       BC.OnlineScene,
       BC.GalleryScene,

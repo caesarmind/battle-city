@@ -138,7 +138,7 @@
 
   // Build version, exchanged in the online handshake: both players must run
   // the same build so locally-constructed stages match the host's simulation.
-  BC.VERSION = '5.18';
+  BC.VERSION = '5.19';
 
   // Live per-run state (reset by GameScene on new game)
   BC.session = null;
@@ -5541,9 +5541,10 @@
       const set = BC.romrules.STAGE_SETS[this.sel % 7];
       const last = set.first + set.count - 1;
       const hard = this.sel >= 7;
-      this.infoLines[0].setText(set.count === 36
-        ? (set.count + ' STAGES: 1-36 FULL RUN')
-        : (set.count + ' STAGES: ' + set.first + '-' + last + ' LOOPS'));
+      // "MAPS", not "STAGES": the stage counter climbs forever and difficulty
+      // keeps rising with it - it is the MAP SET that repeats, which is why
+      // Stage Select still offers numbers past the count (BC.romrules.layoutFor)
+      this.infoLines[0].setText(set.count + ' MAPS ' + set.first + '-' + last + '. THEN LOOP');
       this.infoLines[1].setText(hard ? 'HARD MODE. LIGHT TANK' : 'NORMAL MODE. SMALL TANK');
       this.infoLines[2].setText(hard ? 'ENEMIES TAKE BONUSES' : 'ENEMIES IGNORE BONUSES');
       this.infoLines[3].setText(hard ? 'FAST SHOT: ALL BUT BASIC' : 'FAST SHOT: POWER ONLY');

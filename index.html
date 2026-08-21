@@ -138,7 +138,7 @@
 
   // Build version, exchanged in the online handshake: both players must run
   // the same build so locally-constructed stages match the host's simulation.
-  BC.VERSION = '5.15';
+  BC.VERSION = '5.16';
 
   // Live per-run state (reset by GameScene on new game)
   BC.session = null;
@@ -4448,7 +4448,10 @@
       if (this.timer > 0) return;
       if (this.spawnedCount >= this.total) return;
       if (this.activeCount() + this.pendingFlickers >= this.cfg.maxConcurrent) {
-        this.timer = 100; // NES retries every frame once a slot frees
+        // sub_DB48: once the cooldown has elapsed the ROM leaves $82 at zero
+        // and re-scans the slot table on EVERY frame, so a freed slot refills
+        // on the very next one. Retry next frame, not after a fresh delay.
+        this.timer = 0;
         return;
       }
       // spawn points cycle unconditionally (as in the original) - a tank
@@ -5453,12 +5456,17 @@
       this.rowTexts = [];
       this.cursor = this.add.image(0, 0, 'atlas', 'tank_p0_0').setAngle(90);
 
-      // stage count + hard/normal for whichever row the cursor is on right
-      // now, so the player can compare before confirming with ENTER
+      // Full rule summary for whichever row the cursor is on right now, so
+      // variants can be compared before ENTER commits. Four lines fit under
+      // the row list in both the tall single column and the short two-column
+      // layout; tank names are the manual's own ("малый"/"лёгкий" tank).
       const rowsPerCol = this.cols === 1 ? 14 : 7;
-      const infoY = this.topY + (rowsPerCol - 1) * this.rowGap + 16;
-      this.stagesText = BC.mkText(this, cx, infoY, '', 7, '#c0c0c0').setOrigin(0.5);
-      this.modeText = BC.mkText(this, cx, infoY + 10, '', 7, '#c0c0c0').setOrigin(0.5);
+      const infoY = this.topY + (rowsPerCol - 1) * this.rowGap + 10;
+      this.infoLines = [];
+      for (let i = 0; i < 4; i++) {
+        this.infoLines.push(BC.mkText(this, cx, infoY + i * 10, '', 7, i === 0 ? '#e8e8e8' : '#a0a0a0')
+          .setOrigin(0.5));
+      }
 
       this.selectText = BC.mkText(this, cx, H - 46, '', 10, '#e8a000').setOrigin(0.5);
       BC.mkText(this, cx, H - 30, 'SELECT CHANGES RULES', 6, '#707070').setOrigin(0.5);
@@ -5518,10 +5526,13 @@
       // across both halves (A-G then H-N) - see BC.romrules.stageSet()
       const set = BC.romrules.STAGE_SETS[this.sel % 7];
       const last = set.first + set.count - 1;
-      this.stagesText.setText(set.count === 36
+      const hard = this.sel >= 7;
+      this.infoLines[0].setText(set.count === 36
         ? (set.count + ' STAGES: 1-36 FULL RUN')
         : (set.count + ' STAGES: ' + set.first + '-' + last + ' LOOPS'));
-      this.modeText.setText(this.sel >= 7 ? 'HARD MODE' : 'NORMAL MODE');
+      this.infoLines[1].setText(hard ? 'HARD MODE. LIGHT TANK' : 'NORMAL MODE. SMALL TANK');
+      this.infoLines[2].setText(hard ? 'ENEMIES TAKE BONUSES' : 'ENEMIES IGNORE BONUSES');
+      this.infoLines[3].setText(hard ? 'FAST SHOT: ALL BUT BASIC' : 'FAST SHOT: POWER ONLY');
     }
 
     toggleSelect() {

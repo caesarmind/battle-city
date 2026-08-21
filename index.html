@@ -138,7 +138,7 @@
 
   // Build version, exchanged in the online handshake: both players must run
   // the same build so locally-constructed stages match the host's simulation.
-  BC.VERSION = '5.17';
+  BC.VERSION = '5.18';
 
   // Live per-run state (reset by GameScene on new game)
   BC.session = null;
@@ -4218,9 +4218,21 @@
 // palette flickers by remaining HP like the original armor tank) and flashing
 // (bonus: absorbs the first hit and drops an item).
 (function () {
-  // No type carries special hit points. $A8,X & $03 is rolled per spawn and is
-  // the only source of extra hits, so the armour tank ($E0) is a 1-hit tank
-  // like the rest; the familiar 4-hit tank is the single case handled below.
+  // Hit points live in $A8,X & $03 in both ROMs, but they get there differently.
+  //
+  // Stock Battle City ($E3F4): the spawn code tests the type for #$E0 and does
+  // ORA #$03 - saturating the 2-bit armour field - so the armour tank always
+  // takes 4 hits, and a per-spawn roll could never push it past 4.
+  //
+  // This cart DELETED that instruction: $E3EF-$E3F8 is overwritten with the
+  // enemy-destroyed routine that clears the pontoon flag, leaving stock's tail
+  // stranded as unreachable bytes at $E3F9. Type 4 there is a 1-hit tank and
+  // all toughness comes from the independent armour roll (tbl_C5AD, 0..2).
+  //
+  // Restored to the stock behaviour by request: type 3 is always a 4-hit tank.
+  // Note the cart rolls types uniformly 1-in-4 every spawn (no per-stage
+  // roster), so this makes roughly a quarter of every wave a 4-hit tank from
+  // stage 1 - harder than stock, where the roster gated them.
   const TYPES = [
     { speed: 30, bullets: 1 }, // basic  (0.5 px/frame)
     { speed: 60, bullets: 1 }, // fast   (1.0 px/frame)
@@ -4243,9 +4255,11 @@
         isPlayer: false,
       });
       this.type = type;
-      // $E7DA-$E7E1: a bonus armour tank that rolled no armour ($A8,X == $E4)
-      // decrements to $E3 on the item-revealing hit, so it takes 4 in total.
-      this.hp = (type === 3 && flashing && !armorLayers) ? 4 : 1 + (armorLayers || 0);
+      // Stock's ORA #$03 saturates the armour field, so the roll cannot stack
+      // on top of it - a heavy tank is 4 hits whether or not it rolled armour,
+      // and whether or not it is flashing (a flashing one spends its first hit
+      // revealing the item, then takes the remaining 3, per loc_E7DA).
+      this.hp = type === 3 ? 4 : 1 + (armorLayers || 0);
       this.flashing = flashing;
       this.cfg = cfg;
       this.index = index || 0;
@@ -6160,7 +6174,9 @@
         { cycle: ['tank_e0_n_0_0', 'tank_e0_n_0_1'], name: 'BASIC', desc: '100 PTS. STEADY', enemyType: 0 },
         { cycle: ['tank_e1_n_0_0', 'tank_e1_n_0_1'], name: 'FAST', desc: '200 PTS. VERY QUICK', enemyType: 1 },
         { cycle: ['tank_e2_n_0_0', 'tank_e2_n_0_1'], name: 'POWER', desc: '300 PTS. FAST BULLETS', enemyType: 2 },
-        { cycle: ['tank_e3_h4_0_0', 'tank_e3_h4_0_1'], name: 'MASSIVE', desc: '400 PTS. 4HP TWIN GUN', enemyType: 3 },
+        // the manual's own name for type 4 is "тяжёлый танк". No twin gun in
+        // either ROM - every enemy type fires one bullet at a time.
+        { cycle: ['tank_e3_h4_0_0', 'tank_e3_h4_0_1'], name: 'HEAVY', desc: '400 PTS. TAKES 4 HITS', enemyType: 3 },
         {
           // the game flickers a palette PAIR per remaining HP (see enemy.js
           // palettePair): 4hp green/silver, 3hp gold/silver, 2hp gold/green,

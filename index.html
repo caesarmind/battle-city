@@ -138,7 +138,7 @@
 
   // Build version, exchanged in the online handshake: both players must run
   // the same build so locally-constructed stages match the host's simulation.
-  BC.VERSION = '5.16';
+  BC.VERSION = '5.17';
 
   // Live per-run state (reset by GameScene on new game)
   BC.session = null;
@@ -3019,7 +3019,7 @@
       groups: n >= 20
         ? [[3, armor], [2, power], [1, fast], [0, basic]]
         : [[0, basic], [2, power], [1, fast], [3, armor]],
-      maxConcurrent: 4,          // 4 in 1P; GameScene raises to 6 in 2P (NES-exact)
+      maxConcurrent: 4,          // $6C=5 -> slots 5..2; GameScene sets 6 for 2P ($6C=7)
       spawnDelayMs: Math.round(spawnFrames * 1000 / 60),
       spawnFrames: spawnFrames,  // the AI phase clock derives from this (see enemy.js)
       // Fixed NES timer durations (10/20 ticks of 64 frames)
@@ -6355,13 +6355,19 @@
       this.fieldOy = L.fieldOy;
       this.cfg = BC.difficulty(this.stageN);
       if (BC.session.players.length === 2) {
-        // NES-exact 2P adjustments: 6 concurrent enemies, spawn 20 frames
-        // sooner - and the AI phase clock derives from the same interval
-        this.cfg = Object.assign({}, this.cfg, {
-          maxConcurrent: 6,
-          spawnFrames: this.cfg.spawnFrames - 20,
-          spawnDelayMs: Math.max(100, Math.round((this.cfg.spawnFrames - 20) * 1000 / 60)),
-        });
+        // The cart's only two-player concession is a bigger slot table: the
+        // jump table at $CA69 dispatches on $83 (0 = 1P, 1 = 2P) and writes
+        // $6C = 5 or 7, and loc_DB57 scans slots $6C..2 - so 4 enemies at
+        // once in 1P, 6 in 2P.
+        //
+        // The spawn INTERVAL is not adjusted. $82 only ever receives $84
+        // ($DB5F), and $84 is written only by the roll at $C391-$C3B2, which
+        // reads $85 (the stage) and nothing else. An older "-20 frames in 2P"
+        // here came from stock Battle City, not this cart, and also drove
+        // cfg.spawnFrames negative - which made enemy.js retarget() skip the
+        // roam and chase phases outright and beeline for the base from frame
+        // one in every two-player game.
+        this.cfg = Object.assign({}, this.cfg, { maxConcurrent: 6 });
       }
       if (this.testMode) {
         // test range: unhurried enemies so surfaces and items can be tried

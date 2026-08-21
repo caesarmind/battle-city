@@ -96,11 +96,18 @@
   BC.ENEMY = { BASIC: 0, FAST: 1, POWER: 2, ARMOR: 3 };
   BC.ENEMY_SCORE = [100, 200, 300, 400];
   // Eight ids, dispatched through tbl_E9E2 ($E9E2). Ids 6 and 7 are specific
-  // to this cart: a triple star that jumps straight to max tier, and a
-  // one-shot revive that absorbs the next fatal hit.
+  // to this cart, and the cart's own manual names them:
+  //   6 PISTOLET  "upgrades the tank straight to heavy; taken while already
+  //               heavy it toggles the ability to destroy trees"
+  //   7 PONTON    "available in modifications 15-28. The tank gains the
+  //               ability to move over water via an attached pontoon, which
+  //               also protects it from 1 shell"
+  // The pontoon flag is $0170,X - granted at $FEA1, drawn as an attached
+  // sprite (tile $63) by the loop at loc_FEAD over all 8 tank slots, and
+  // spent instead of the kill at loc_FF66.
   BC.POWERUP = {
     HELMET: 0, CLOCK: 1, SHOVEL: 2, STAR: 3,
-    GRENADE: 4, TANK: 5, TRIPLE_STAR: 6, REVIVE: 7,
+    GRENADE: 4, TANK: 5, GUN: 6, PONTOON: 7,
   };
   BC.POWERUP_SCORE = 500;
   BC.EXTRA_LIFE_SCORE = 20000;
@@ -131,7 +138,7 @@
 
   // Build version, exchanged in the online handshake: both players must run
   // the same build so locally-constructed stages match the host's simulation.
-  BC.VERSION = '5.14';
+  BC.VERSION = '5.15';
 
   // Live per-run state (reset by GameScene on new game)
   BC.session = null;
@@ -1127,33 +1134,33 @@
         '..........',
       ],
     },
-    { // 6 triple star: three gold blocks, jumps straight to max tier
-      pal: { Y: '#f8b800' },
+    { // 6 gun ("PISTOLET"): pistol - straight to heavy tier, toggles tree-busting
+      pal: { S: '#c8c8c8', H: '#b06820' },
       art: [
         '..........',
         '..........',
-        '.YY.YY.YY.',
-        '.YY.YY.YY.',
-        '.YY.YY.YY.',
-        '..........',
-        '..........',
-        '..........',
+        '.SSSSSSS..',
+        '.SSSSSSSS.',
+        '.SSHHS....',
+        '...HH.....',
+        '...HHH....',
+        '...HHH....',
         '..........',
         '..........',
       ],
     },
-    { // 7 revive: heart, absorbs the next fatal hit
-      pal: { R: '#e04868' },
+    { // 7 pontoon ("PONTON"): raft - crosses water, absorbs one shell
+      pal: { W: '#e8e8e8', B: '#3878c8' },
       art: [
         '..........',
-        '..RR..RR..',
-        '.RRRRRRRR.',
-        '.RRRRRRRR.',
-        '.RRRRRRRR.',
-        '..RRRRRR..',
-        '...RRRR...',
-        '....RR....',
         '..........',
+        '...WW.....',
+        '...WWWW...',
+        'WWWWWWWWWW',
+        '.WWWWWWWW.',
+        '..WWWWWW..',
+        '..........',
+        'BB.BB.BB.B',
         '..........',
       ],
     },
@@ -3432,8 +3439,11 @@
       return v === T.BRICK || (v >= T.BRICK_T && v <= T.BRICK_R);
     }
 
-    static solidForTank(v) {
-      return BC.Terrain.isBrick(v) || v === T.STEEL || v === T.WATER || v === T.EAGLE;
+    // canSwim: the tank is carrying a pontoon (or is already sitting in water
+    // and needs to drive back out - see BC.Tank._canSwim)
+    static solidForTank(v, canSwim) {
+      if (v === T.WATER) return !canSwim;
+      return BC.Terrain.isBrick(v) || v === T.STEEL || v === T.EAGLE;
     }
 
     static solidForBullet(v) {
@@ -3511,7 +3521,7 @@
     // Bullet impact resolution. bx/by = bullet center in field px (0..208),
     // dir = travel direction, canBreakSteel = tier-3 player bullet.
     // Returns 'none' | 'brick' | 'steel' | 'eagle' | 'bound'.
-    strike(bx, by, dir, canBreakSteel) {
+    strike(bx, by, dir, canBreakSteel, bustTrees) {
       const dv = BC.DVEC[dir];
       const tipX = bx + dv.x * 2;
       const tipY = by + dv.y * 2;
@@ -3526,6 +3536,14 @@
         const col = Math.floor((dv.x > 0 ? tipX - 0.01 : tipX) / 8);
         const r = Math.round(by / 8);
         cells = [[col, r - 1], [col, r]];
+      }
+
+      // A gun-boosted heavy tank clears trees it shoots through. Trees never
+      // blocked bullets, so this removes them without stopping the shot.
+      if (bustTrees) {
+        for (const [sx, sy] of cells) {
+          if (this.get(sx, sy) === T.TREES) this.set(sx, sy, T.EMPTY);
+        }
       }
 
       let hitBrick = false, hitSteel = false, hitEagle = false;
@@ -3851,6 +3869,10 @@
       this.animFrame = 0;
       this.animDist = 0;
       this.skid = 0;
+      // pontoon ($0170,X): drive over water, and absorb one shell. Lives on
+      // the base class because the ROM tracks it for every tank slot, so an
+      // enemy that grabs the item in a 15-28 variant gets it too.
+      this.pontoon = false;
       // Player-only 180-turn lock (see drive()): -1 = not locked, otherwise
       // the direction a reversal turned to face but hasn't been cleared to
       // drive in yet.
@@ -3883,6 +3905,21 @@
       return { l: this.x - 8, r: this.x + 8, t: this.y - 8, b: this.y + 8 };
     }
 
+    // Water is passable while the pontoon is held. It stays passable while the
+    // tank still overlaps water even without one - otherwise losing the pontoon
+    // mid-river would wall the tank in on every side with no way out. Same
+    // escape principle as the already-overlapping-tanks rule in _axisMove.
+    _canSwim() {
+      if (this.pontoon) return true;
+      const c0 = Math.floor((this.x - 8) / 8), r0 = Math.floor((this.y - 8) / 8);
+      for (let dy = 0; dy < 2; dy++) {
+        for (let dx = 0; dx < 2; dx++) {
+          if (this.terrain.get(c0 + dx, r0 + dy) === BC.T.WATER) return true;
+        }
+      }
+      return false;
+    }
+
     // Move one axis with terrain + bounds + tank clamping. Returns px moved.
     _axisMove(dir, dist, tanks) {
       const dv = BC.DVEC[dir];
@@ -3902,10 +3939,11 @@
       const fw = dv.x + dv.y; // +1 or -1 along the axis
       let cell = fw > 0 ? Math.ceil(lead / 8) : Math.floor((lead - 0.001) / 8);
       const target = lead + fw * allowed;
+      const swim = this._canSwim();
       while (fw > 0 ? cell * 8 < target : (cell + 1) * 8 > target) {
         const solid = horiz
-          ? Terrain.solidForTank(this.terrain.get(cell, crossLow)) || Terrain.solidForTank(this.terrain.get(cell, crossLow + 1))
-          : Terrain.solidForTank(this.terrain.get(crossLow, cell)) || Terrain.solidForTank(this.terrain.get(crossLow + 1, cell));
+          ? Terrain.solidForTank(this.terrain.get(cell, crossLow), swim) || Terrain.solidForTank(this.terrain.get(cell, crossLow + 1), swim)
+          : Terrain.solidForTank(this.terrain.get(crossLow, cell), swim) || Terrain.solidForTank(this.terrain.get(crossLow + 1, cell), swim);
         if (solid) {
           allowed = fw > 0 ? cell * 8 - lead : lead - (cell + 1) * 8;
           break;
@@ -4084,6 +4122,8 @@
       this.alive = true;
       this.skid = 0;
       this.stunnedUntil = 0;
+      this.pontoon = false;   // both cart extras are lost with the tank
+      this.bustTrees = false;
       this.sprite.setVisible(true);
       this.sprite.setAlpha(1);
       this.applyTier();
@@ -4119,6 +4159,7 @@
           fromPlayer: true,
           owner: this,
           canBreakSteel: this.tier >= 3,
+          bustTrees: !!this.bustTrees, // gun taken at heavy tier
         });
         this.fireCooldown = 120; // Tank 1990 rapid-fire cadence on held button
         BC.sfx.play('fire');
@@ -4146,9 +4187,9 @@
     // returns true if the hit killed the player
     hit() {
       if (!this.alive || this.isShielded()) return false;
-      // loc_FF66: a one-shot revive ($0170,X) is spent instead of the kill
-      if (this.revive) {
-        this.revive = false;
+      // loc_FF66: the pontoon ($0170,X) is spent instead of the kill
+      if (this.pontoon) {
+        this.pontoon = false;
         BC.sfx.play('hit');
         return false;
       }
@@ -4324,6 +4365,13 @@
         this.flashing = false;
         this.sprite.setAlpha(1);
         this.scene.powerups.spawn();
+      }
+      // loc_FF66 covers every tank slot, so an enemy carrying a pontoon
+      // spends it instead of taking the hit, exactly like a player
+      if (this.pontoon) {
+        this.pontoon = false;
+        BC.sfx.play('hit');
+        return false;
       }
       this.hp -= 1;
       if (this.hp > 0) {
@@ -4506,6 +4554,7 @@
       b.owner = owner;
       b.fromPlayer = !!opts.fromPlayer;
       b.canBreakSteel = !!opts.canBreakSteel;
+      b.bustTrees = !!opts.bustTrees;
       b.alive = true;
       b.sprite.setVisible(true);
       b.sprite.angle = dir * 90;
@@ -4543,7 +4592,7 @@
           step -= adv;
           b.x += dv.x * adv;
           b.y += dv.y * adv;
-          const res = this.terrain.strike(b.x, b.y, b.dir, b.canBreakSteel);
+          const res = this.terrain.strike(b.x, b.y, b.dir, b.canBreakSteel, b.bustTrees);
           if (res === 'bound') {
             if (b.fromPlayer) BC.sfx.play('steel');
             this.kill(b, true);
@@ -4742,13 +4791,18 @@
       } else if (type === P.TANK) {
         player.state.lives += 1;
         BC.sfx.play('life');
-      } else if (type === P.TRIPLE_STAR) {
-        // $C613: straight to the top tier rather than one star at a time
-        player.state.tier = 3;
-        player.applyTier();
-      } else if (type === P.REVIVE) {
-        // $FEA7 sets $0170,X = $FF; loc_FF66 spends it instead of killing
-        player.revive = true;
+      } else if (type === P.GUN) {
+        // manual: "upgrades the tank straight to heavy; taken while already
+        // heavy it toggles the ability to destroy trees"
+        if (player.state.tier >= 3) {
+          player.bustTrees = !player.bustTrees;
+        } else {
+          player.state.tier = 3;
+          player.applyTier();
+        }
+      } else if (type === P.PONTOON) {
+        // $FEA1 sets $0170,X = $FF: cross water, and absorb one shell
+        player.pontoon = true;
       }
       scene.events.emit('hud');
     }
@@ -4782,6 +4836,10 @@
         for (const p of scene.players) {
           if (p && p.alive) p.hit(); // spawn/helmet shields still protect
         }
+      } else if (type === P.PONTOON) {
+        // the pontoon is per-tank ($0170,X): only the enemy that drove over
+        // it gets to cross water and shrug off a shell
+        enemy.pontoon = true;
       }
       scene.events.emit('hud');
     }
@@ -6062,8 +6120,10 @@
     return BC.romrules.enemiesTakeItems() ? 'ENEMIES CAN GRAB THEM TOO' : 'ENEMIES DO NOT GRAB THEM';
   }
 
-  function reviveDesc() {
-    return BC.romrules.v8e ? 'SAVES FROM NEXT DEATH' : 'NOT IN THIS VARIANT';
+  // the manual gates the pontoon on the SELECT half: "available in
+  // modifications 15-28", which is exactly BC.romrules.v8e
+  function pontoonDesc() {
+    return BC.romrules.v8e ? 'CROSS WATER. STOPS 1 HIT' : 'NOT IN THIS VARIANT';
   }
 
   function steelDesc() {
@@ -6120,8 +6180,8 @@
       title: 'BONUS ITEMS',
       subtitle: 'THIS CART ONLY',
       rows: [
-        { cycle: ['pw6'], name: 'TRIPLE STAR', desc: 'MAX TIER INSTANTLY' },
-        { cycle: ['pw7'], name: 'REVIVE', desc: reviveDesc, dim: () => !BC.romrules.v8e },
+        { cycle: ['pw6'], name: 'GUN', desc: 'MAX TIER. THEN TREES' },
+        { cycle: ['pw7'], name: 'PONTOON', desc: pontoonDesc, dim: () => !BC.romrules.v8e },
       ],
     },
     {
